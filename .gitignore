@@ -1,2 +1,14 @@
 
+.env
+
 .sops/**
+
+.quip2md/
+export/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/

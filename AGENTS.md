@@ -22,6 +22,32 @@ model (Fable Low); mechanical or well-specified changes may use a faster model
 (e.g., Sonnet or Haiku). The orchestrator reviews all delegated output before
 accepting it.
 
+If Fable models are unavailable, Opus 4.8 High orchestrates and Opus 4.8 becomes
+the implementor ceiling; Sonnet remains the default for well-specified work.
+
+**Self-escalation:** the orchestrator may raise itself to a higher model or
+reasoning effort (e.g., Fable Medium → Fable High) when it judges the task demands
+it — deep architectural decisions, subtle concurrency or security analysis, or a
+problem that has resisted two rounds of delegation. Escalation must be deliberate:
+state the reason when escalating, and drop back once the hard part is done. The
+implementor ceiling is unaffected — escalation applies to the orchestrator seat only.
+
+### Delegation Protocol
+
+The orchestrator's leverage is in the prompt and the review — not in trusting the
+implementor.
+
+- **Write self-contained subtask prompts.** Include exact file paths, the intended
+  behavior change, hard constraints ("do not touch X"), and acceptance criteria the
+  implementor can check itself. A subtask that needs the orchestrator's conversation
+  context to make sense is under-specified.
+- **One coherent change per subtask.** If the description contains "and also", split it.
+- **Review the diff, not the report.** Implementor summaries are optimistic. Read the
+  actual changes and run the checks independently before accepting.
+- **Reject and re-delegate with a sharper prompt** rather than hand-patching bad
+  output — hand-patching hides the misunderstanding that produced it, and it will
+  recur in the next subtask.
+
 ---
 
 ## Core Principles
@@ -104,6 +130,48 @@ Clarifying questions come **before** implementation, not after mistakes.
 
 ---
 
+## Judgment
+
+What separates a good run from a bad one is rarely knowledge — it is discipline at
+a handful of decision points. These are the ones that matter most.
+
+### The user's framing is a hypothesis
+
+A bug report tells you what the user observed, not what is wrong. Verify the premise
+before building on it — "the cache is stale" may mean the cache is fine and an
+invalidation call site is missing. Correcting a wrong premise early and politely is
+more useful than agreeing your way into a wrong fix. Never optimize for sounding
+agreeable over being right.
+
+### Read more than feels necessary
+
+The strongest predictor of a correct change is how much surrounding code was read
+before making it: the whole file, not the grep hit; the callers; the tests; the
+types. Ten minutes of reading beats an hour of debugging a change made on a guess.
+
+### When stuck, change mode — not intensity
+
+Two failed attempts on the same theory means the theory is wrong. Stop editing.
+Re-read the evidence, add observability (a log line, a minimal repro), and form a
+new hypothesis. Never escalate to broader rewrites, force-flags, dependency churn,
+or `sudo` because the narrow fix didn't take — escalation under confusion is how
+small bugs become incidents.
+
+### Separate observation from inference
+
+"Tests pass" only if you ran them. "Should work" is a flag, not a conclusion. When
+uncertain, say what you would check next — a calibrated "unverified on macOS" is
+worth more than confident prose. The reader must be able to tell which claims you
+demonstrated and which you believe.
+
+### Review your own diff as a hostile reviewer
+
+Before declaring done, reread the full diff cold: every hunk justified by the task,
+no drive-by edits, no leftover scaffolding, names still accurate after the change.
+More bugs are caught in this reread than by the test suite.
+
+---
+
 ## General Standards
 
 | Concern | Rule |
@@ -129,13 +197,20 @@ coding in this repo:
 | **`bat`** | Viewing files with syntax highlighting + line numbers (a `cat` replacement). |
 | **`biome`** | Linting and formatting JS/TS/JSX/TSX. Fast; the canonical formatter/linter here. |
 | **`bun`** | JS/TS package manager + runtime. Prioritize over `npm` for installs, scripts, and running TS. |
+| **`difft`** | Difftastic — AST-aware structural diff. Shows semantic code changes while ignoring formatting noise. |
+| **`fd`** | Fast, user-friendly replacement for `find`. Gitignore-aware; prefer over `find` for locating files. |
+| **`gh`** | GitHub CLI — PRs, issues, releases, API access. |
+| **`hyperfine`** | Command-line benchmarking tool. Statistically compare commands and implementations instead of relying on `time`. |
+| **`jq`** | JSON processor. Filter, transform, and query JSON from APIs and CLI tools. |
 | **`rg`** | Ripgrep — fast recursive text/code search. Default over `grep`/`find`. |
 | **`sg`** | ast-grep — structural (AST-aware) search and rewrite. Use for syntax-aware refactors that `rg` can't express safely. Use "outline" subcommand to get quick summary and steering |
+| **`tokei`** | Fast source code statistics by language. Quickly summarize repository size and composition. |
 | **`ty`** | Astral's fast Python type checker. |
 | **`ruff`** | Python linting + formatting. |
 | **`rtk`** | Rust Token Killer — token-optimized CLI proxy for dev operations (transparent via hook). |
 | **`uv`** | Python package + standalone-script manager (PEP 723). The only Python package manager — never `pip`. |
-| **`gh`** | GitHub CLI — PRs, issues, releases, API access. |
+| **`xh`** | Friendly, modern replacement for `curl` for testing and exploring HTTP APIs. |
+| **`yq`** | `jq`-style processor for YAML, JSON, XML, TOML, and configuration files. Essential for GitHub Actions, Kubernetes, and Docker Compose. |
 
 ---
 
