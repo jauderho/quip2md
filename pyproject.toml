@@ -9,6 +9,7 @@ dependencies = [
     "markdownify",
     "python-dotenv",
     "markdown>=3.10.2",
+    "markdown-it-py>=4.0.0",
     "lxml>=6.1.1",
 ]
 
@@ -18,6 +19,7 @@ quip2md = "quip2md.cli:main"
 [dependency-groups]
 dev = [
     "pytest",
+    "pytest-xdist>=3.8.0",
     "ruff",
     "ty",
 ]
@@ -28,6 +30,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/quip2md"]
+
+[tool.pytest.ini_options]
+# 4 workers matches the performance-core count of the development machines
+# (4P+4E Apple Silicon); -n 8 oversubscribes and measures slower.
+addopts = "-n 4"
 
 [tool.ruff]
 line-length = 100
