@@ -23,9 +23,10 @@ The algorithm, per note:
 * Consecutive items needing the same depth are indented as one selection, since
   the menu command applies to every selected line at once.
 * **Every step is verified before the next one runs.** After each step the note
-  is read back and compared against the depths expected so far; a mismatch
-  applies Decrease once per Increase, checks that the note really was restored,
-  and aborts the whole run.
+  is read back; text must be unchanged, and the step must have reduced the
+  note's total depth error. A step that did neither is walked back with
+  Decrease and the note is abandoned -- the rest of the run continues, because
+  notes are independent.
 
 That per-step check is what makes the pass safe to point at real notes.
 Navigation is inherently approximate -- the caret moves by paragraph, but a
@@ -38,7 +39,8 @@ more than depth: every plan line must still be findable, in order, by text.
 
 This needs macOS Accessibility permission for whatever binary runs it (System
 Events UI scripting). Without it the pass refuses to start rather than
-half-applying; the non-breaking-space fallback in `enex.py` covers that case.
+half-applying, and the checklists stay flat -- which is exactly how they
+arrive from the importer, so nothing is lost by not running it.
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ import logging
 import re
 import subprocess
 import sys
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import Protocol
@@ -63,9 +66,13 @@ _OSASCRIPT_TIMEOUT_SECONDS = 120.0
 #: Safety net on the convergence loop, not a budget: a step now costs a short
 #: hop from the previous selection rather than a walk from the top of the
 #: document, so a long note can afford hundreds. What actually stops the loop
-#: is running out of work, or a line Notes will not move. The corpus's worst
-#: note needs a little over three hundred.
+#: is running out of work, or a line Notes will not move.
 MAX_STEPS_PER_NOTE = 600
+
+#: How many times a line Notes refused to move is offered another try after
+#: later progress. Unlimited retries cost one wasted step per success on a
+#: note with a permanently immovable line.
+MAX_STUCK_RETRIES = 3
 
 #: Menu items under Format > Indentation. English-only, like the rest of the
 #: AppleScript here.
@@ -503,10 +510,11 @@ def indent_notes(
 
     for position, (note_id, label, items) in enumerate(targets, start=1):
         report.notes_considered += 1
-        if not any(item.depth for item in items):
-            report.notes_already_flat += 1
-            continue
-
+        # Deliberately no "the plan is all depth 0, skip it" shortcut here.
+        # Steps carry the difference from where a line actually sits, so a note
+        # that is too *deep* -- left that way by an interrupted run, or by a
+        # hand edit -- needs outdenting even though its plan asks for none.
+        # Whether there is work to do is decided below, from the note itself.
         try:
             body = runner.read_body(note_id)
         except Exception as exc:  # broad by design: reported, then the run stops
@@ -569,6 +577,8 @@ def indent_notes(
         # parent above a line, and one such line must not cost the note every
         # other correction, so they are set aside and the rest carries on.
         stuck: set[int] = set()
+        attempts: Counter[int] = Counter()
+        applied_here = 0
         distance = _depth_distance(items, observed)
 
         for _iteration in range(MAX_STEPS_PER_NOTE):
@@ -619,17 +629,34 @@ def indent_notes(
                 # real progress that leaves the line still wrong. Counting lines
                 # made the pass abandon notes it was successfully fixing.
                 if after != observed:
-                    # It moved something, just not usefully. Put it back.
+                    # It moved something, just not usefully. Put it back, and
+                    # re-read *both* models: the undo shifts lines as surely as
+                    # the step did, so the caret positions taken after the step
+                    # describe a note that no longer exists.
                     for _ in range(abs(aimed.levels)):
                         runner.undo(outdent=aimed.levels > 0)
                     body = runner.read_body(note_id)
                     reverted = locate_checklist_paragraphs(body, items)
-                    moved = reverted if reverted is not None else moved
-                    after = observed_depths(body, moved)
+                    reverted_carets = locate_lines(runner.read_lines(note_id), items)
+                    if (
+                        reverted is None
+                        or reverted_carets is None
+                        or observed_depths(body, reverted) != observed
+                    ):
+                        # Half-undone is worse than unindented, and this pass
+                        # cannot reason about the note any more.
+                        report.failures.append(
+                            (label, f"undo did not restore the note; check it by hand: {label}")
+                        )
+                        failed_note = True
+                        break
+                    moved, shifted, after = reverted, reverted_carets, observed
                 # A step that changed nothing at all needs no undo -- and must
                 # not get one, because Decrease is not a no-op even where
                 # Increase was, so "undoing" it would outdent a correct line.
-                stuck.update(range(step.start, step.start + step.count))
+                for index in range(step.start, step.start + step.count):
+                    attempts[index] += 1
+                    stuck.add(index)
                 cursor = None
                 observed, paragraphs, carets = after, moved, shifted
                 distance = _depth_distance(items, observed)
@@ -641,9 +668,13 @@ def indent_notes(
             # around it settle -- it needs a parent above it, and that parent
             # may only just have arrived. Any real progress therefore earns
             # every stuck line another try, which is what lets one run finish
-            # the job instead of converging over four.
-            stuck.clear()
+            # the job instead of converging over four. Only a few tries each,
+            # though: a permanently immovable line would otherwise cost one
+            # wasted step per success and could exhaust the budget on a long
+            # note that was already as good as it will get.
+            stuck = {index for index in stuck if attempts[index] >= MAX_STUCK_RETRIES}
             cursor = step.start + step.count - 1
+            applied_here += abs(step.levels) * step.count
             report.levels_applied += abs(step.levels) * step.count
         else:
             report.failures.append(
@@ -666,7 +697,12 @@ def indent_notes(
 
         if failed_note:
             continue
-        report.notes_indented += 1
+        if applied_here:
+            report.notes_indented += 1
+        else:
+            # Every step was refused. Counting this as an indented note would
+            # report work that did not happen; the refusal is already named.
+            report.notes_already_flat += 1
 
     return report
 

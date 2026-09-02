@@ -785,3 +785,204 @@ def test_any_other_osascript_failure_keeps_its_own_message(
     _stub_subprocess(monkeypatch, returncode=2, stderr="something else went wrong")
     with pytest.raises(NotesError, match="status 2"):
         IndentRunner().undo(outdent=True)
+
+
+# --- Adversarial review: the loop's damage-control paths ---------------------
+
+
+@dataclass
+class HalfUndoingRunner(SimulatingIndentRunner):
+    """Moves lines the wrong way, and only half puts them back.
+
+    This is the shape that matters: `Decrease` is not the exact inverse of an
+    `Increase` that Notes silently refused, so an "undo" can leave a note in a
+    state that is neither where it started nor where it was going.
+    """
+
+    def apply_step(self, step: IndentStep, *, origin: int | None = None) -> None:
+        self.applied.append(step)
+        for index in range(step.start, step.start + step.count):
+            self.depths[index] += 1  # away from the target, so no progress
+
+    def undo(self, *, outdent: bool) -> None:
+        self.undone += 1  # accepted, and pointedly does nothing
+
+
+def test_an_undo_that_does_not_restore_the_note_abandons_it_by_name() -> None:
+    items = _items(("a", 0), ("b", 0))
+    runner = HalfUndoingRunner(texts=["a", "b"], depths=[0, 1])
+    report = indent_notes(runner, [("id-1", "Doc", items)])
+
+    assert runner.undone == 1
+    assert any("check it by hand" in reason for _, reason in report.failures)
+    assert report.notes_indented == 0
+
+
+def test_a_refused_line_is_retried_only_a_few_times() -> None:
+    """Otherwise one immovable line costs a wasted step per later success.
+
+    On a long note that is enough to exhaust the step budget and report a
+    failure for a note that was already as good as Notes will allow.
+    """
+
+    @dataclass
+    class OneImmovableLine(SimulatingIndentRunner):
+        def apply_step(self, step: IndentStep, *, origin: int | None = None) -> None:
+            self.applied.append(step)
+            if step.start == 0:
+                return  # line 0 never moves
+            for index in range(step.start, step.start + step.count):
+                self.depths[index] += step.levels
+
+    # One immovable line, then plenty of movable ones at alternating depths.
+    texts = [f"line {i}" for i in range(20)]
+    items = _items(*[(t, 1 if i % 2 else 2) for i, t in enumerate(texts)])
+    runner = OneImmovableLine(texts=texts, depths=[0] * 20)
+    report = indent_notes(runner, [("id-1", "Doc", items)])
+
+    attempts_on_line_0 = sum(1 for step in runner.applied if step.start == 0)
+    assert attempts_on_line_0 <= notes_indent.MAX_STUCK_RETRIES + 1
+    assert any("would not move" in reason for _, reason in report.failures)
+
+
+def test_the_editor_lines_are_re_read_after_an_undo() -> None:
+    """The undo shifts lines as surely as the step did.
+
+    Reusing the caret positions taken after the step would aim the next one at
+    a note that no longer exists -- the same class of defect that scrambled a
+    real note's indentation.
+    """
+    reads: list[str] = []
+
+    @dataclass
+    class CountingRunner(SimulatingIndentRunner):
+        def apply_step(self, step: IndentStep, *, origin: int | None = None) -> None:
+            self.applied.append(step)
+            for index in range(step.start, step.start + step.count):
+                self.depths[index] += 1  # wrong way: forces the undo path
+
+        def undo(self, *, outdent: bool) -> None:
+            self.undone += 1
+            step = self.applied[-1]
+            for index in range(step.start, step.start + step.count):
+                self.depths[index] -= 1
+
+        def read_lines(self, note_id: str) -> list[str]:
+            reads.append(note_id)
+            return list(self.texts)
+
+    items = _items(("a", 0), ("b", 0))
+    runner = CountingRunner(texts=["a", "b"], depths=[0, 1])
+    indent_notes(runner, [("id-1", "Doc", items)])
+
+    # Once before the first step, once after it, and once after the undo.
+    assert len(reads) >= 3
+
+
+# --- Adversarial review: failure paths of the real runner -------------------
+
+
+def test_a_note_whose_editor_lines_cannot_be_read_stops_the_run() -> None:
+    @dataclass
+    class NoLines(SimulatingIndentRunner):
+        def read_lines(self, note_id: str) -> list[str]:
+            raise RuntimeError("lines boom")
+
+    runner = NoLines(texts=["a", "b"], depths=[0, 0])
+    report = indent_notes(runner, [("id-1", "Doc", _items(("a", 0), ("b", 1)))])
+
+    assert report.failures == [("Doc", "could not read the note's lines: lines boom")]
+
+
+def test_a_note_the_editor_does_not_show_is_skipped_not_typed_into() -> None:
+    @dataclass
+    class DifferentLines(SimulatingIndentRunner):
+        def read_lines(self, note_id: str) -> list[str]:
+            return ["something else entirely"]
+
+    runner = DifferentLines(texts=["a", "b"], depths=[0, 0])
+    report = indent_notes(runner, [("id-1", "Doc", _items(("a", 0), ("b", 1)))])
+
+    assert runner.applied == []
+    assert report.skipped_unrecognized == 1
+    assert any("editor's lines did not match" in reason for _, reason in report.failures)
+
+
+def test_read_lines_splits_the_editor_value_into_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_subprocess(monkeypatch, returncode=0, stdout="first\nsecond\nthird\n")
+    assert IndentRunner().read_lines("note-1") == ["first", "second", "third"]
+
+
+def test_an_empty_editor_value_is_an_error_not_an_empty_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty list would look like a note with no lines and be skipped."""
+    _stub_subprocess(monkeypatch, returncode=0, stdout="   \n")
+    with pytest.raises(NotesError, match="never became readable"):
+        IndentRunner().read_lines("note-1")
+
+
+def test_a_missing_window_is_not_reported_as_a_permission_problem(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`-1719` covers both, and blaming permissions sends the user nowhere."""
+    _stub_subprocess(
+        monkeypatch,
+        returncode=1,
+        stderr='Can’t get splitter group 1 of window 1 of process "Notes". Invalid index. (-1719)',
+    )
+    with pytest.raises(NotesError) as excinfo:
+        IndentRunner().read_body("note-1")
+    assert "window was not ready" in str(excinfo.value)
+    assert ACCESSIBILITY_HELP not in str(excinfo.value)
+
+
+def test_verify_text_names_a_line_whose_text_changed() -> None:
+    body = "<ul><li>a</li><li>WRONG</li></ul>"
+    reason = notes_indent.verify_text(body, _items(("a", 0), ("b", 1)), [0, 1])
+    assert reason is not None
+    assert "reads 'WRONG'" in reason
+
+
+def test_verify_text_reports_a_paragraph_that_is_gone() -> None:
+    reason = notes_indent.verify_text("<ul><li>a</li></ul>", _items(("a", 0), ("b", 1)), [0, 9])
+    assert reason is not None
+    assert "paragraph 9 is gone" in reason
+
+
+def test_a_note_that_is_too_deep_is_corrected_even_with_an_all_flat_plan() -> None:
+    """A plan of all-zero depths is not the same as "nothing to do".
+
+    A note left over-indented by an interrupted run needs outdenting, and the
+    delta planner can do it. An earlier shortcut skipped such notes before ever
+    reading them.
+    """
+    items = _items(("a", 0), ("b", 0))
+    runner = SimulatingIndentRunner(texts=["a", "b"], depths=[0, 1])
+    report = indent_notes(runner, [("id-1", "Doc", items)])
+
+    assert runner.depths == [0, 0]
+    assert report.notes_indented == 1
+    assert report.failures == []
+
+
+def test_a_note_where_every_step_was_refused_is_not_reported_as_indented() -> None:
+    """Counting it would report work that did not happen.
+
+    A note whose lines Notes will not move ends the pass with no steps left,
+    which looks the same from the loop's end as a note that was fully set.
+    """
+
+    @dataclass
+    class InertRunner2(SimulatingIndentRunner):
+        def apply_step(self, step: IndentStep, *, origin: int | None = None) -> None:
+            self.applied.append(step)
+
+    runner = InertRunner2(texts=["a", "b"], depths=[0, 0])
+    report = indent_notes(runner, [("id-1", "Doc", _items(("a", 0), ("b", 1)))])
+
+    assert report.levels_applied == 0
+    assert report.notes_indented == 0
+    assert any("would not move" in reason for _, reason in report.failures)

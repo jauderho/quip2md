@@ -591,7 +591,13 @@ def test_pass_applies_and_verifies_each_step() -> None:
 
 
 def test_pass_skips_a_flat_note_without_typing() -> None:
-    flat = (ChecklistItem("a", False, 0),)
+    """A note already at the depths the plan asks for is never opened.
+
+    The plan is read against the note itself rather than assumed from its
+    depths, so this also covers the case the shortcut used to hide: a note
+    whose plan is all zeros but which sits too deep still gets corrected.
+    """
+    flat = tuple(ChecklistItem(item.text, item.checked, 0) for item in _PLAN)
     runner = FakeIndentRunner(bodies=[_BODY])
     report = indent_notes(runner, [("id-1", "Doc", flat)])
 
