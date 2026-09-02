@@ -59,8 +59,7 @@ def load_config(
     token = (os.environ.get("QUIP_TOKEN") or file_values.get("QUIP_TOKEN") or "").strip()
     if not token:
         raise ConfigError(
-            "QUIP_TOKEN is missing or empty. Set it in the process environment "
-            "or in a .env file."
+            "QUIP_TOKEN is missing or empty. Set it in the process environment or in a .env file."
         )
 
     base_url = (

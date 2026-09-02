@@ -213,9 +213,7 @@ def _export_one(
             return
     elif thread_type not in (ThreadType.DOCUMENT, ThreadType.SPREADSHEET):
         report.skipped_other += 1
-        logger.warning(
-            "skipping thread %s: unsupported type %s", item.thread_id, thread_type.value
-        )
+        logger.warning("skipping thread %s: unsupported type %s", item.thread_id, thread_type.value)
         return
 
     updated_usec = content.updated_usec if content.updated_usec is not None else 0
@@ -334,7 +332,7 @@ def _load_path_owners(state_path: Path) -> dict[str, str]:
         return {}
     try:
         raw = json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except OSError, json.JSONDecodeError:
         return {}
     if not isinstance(raw, dict):
         return {}
@@ -350,9 +348,7 @@ def _load_path_owners(state_path: Path) -> dict[str, str]:
 # --- asset (blob) resolution ------------------------------------------------
 
 
-def _make_asset_resolver(
-    client: ExportClient, md_dir: Path, report: ExportReport
-) -> AssetResolver:
+def _make_asset_resolver(client: ExportClient, md_dir: Path, report: ExportReport) -> AssetResolver:
     def resolve(thread_id: str, blob_id: str, suggested_ext: str | None) -> str:
         # `suggested_ext` (a best-effort extension parsed from the <img> src
         # URL by convert.py) is intentionally unused: the extension written
