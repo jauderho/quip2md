@@ -64,6 +64,7 @@ from quip2md.notes_import import (
     _content_hash,
     _error_reason,
     _now_iso8601,
+    notes_run_lock,
     scan_source,
 )
 
@@ -679,6 +680,33 @@ def run_enex_import(
     if runner is None:
         raise NotesError("a Notes runner is required for a real (non-dry-run) import")
 
+    with notes_run_lock(config.state_path.parent):
+        return _import_into_notes(
+            runner,
+            report,
+            state,
+            pending,
+            target,
+            started=started,
+            confirm=confirm,
+            timeout_seconds=timeout_seconds,
+            adopt_landing=adopt_landing,
+        )
+
+
+def _import_into_notes(
+    runner: EnexNotesRunnerProtocol,
+    report: EnexImportReport,
+    state: NotesState,
+    pending: Sequence[tuple[NoteSource, NoteEnml]],
+    target: Path,
+    *,
+    started: float,
+    confirm: bool,
+    timeout_seconds: float,
+    adopt_landing: str | None,
+) -> EnexImportReport:
+    """Hand the archive to Notes and file what comes back. Holds the run lock."""
     account = runner.resolve_account(local=False)
     deadline = time.monotonic() + timeout_seconds
 

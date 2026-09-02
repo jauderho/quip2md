@@ -32,7 +32,7 @@ from typing import Protocol
 
 from quip2md.config import Config
 from quip2md.notes_enex import NOTES_STATE_FILENAME
-from quip2md.notes_import import NotesError, NotesState, NoteStateEntry
+from quip2md.notes_import import NotesError, NotesState, NoteStateEntry, notes_run_lock
 
 logger = logging.getLogger("quip2md.notes_prune")
 
@@ -101,6 +101,23 @@ def prune_notes(
     which is what makes this safe to run first and read.
     """
     report = PruneReport(applied=apply)
+    if not apply:
+        return _plan_or_prune(runner, config, report, folders, empty_landing, superseded, False)
+    # Deleting while an import is filing notes could remove one it is about to
+    # record, so a real prune takes the same lock a real import does.
+    with notes_run_lock(Path(config.state_path).parent):
+        return _plan_or_prune(runner, config, report, folders, empty_landing, superseded, True)
+
+
+def _plan_or_prune(
+    runner: PruneRunnerProtocol,
+    config: Config,
+    report: PruneReport,
+    folders: Sequence[str],
+    empty_landing: bool,
+    superseded: bool,
+    apply: bool,
+) -> PruneReport:
     account = runner.resolve_account(local=False)
     top = {info.name: info for info in runner.top_level_folders(account)}
 
