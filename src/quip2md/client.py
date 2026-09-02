@@ -470,7 +470,7 @@ class QuipClient:
             pass
         try:
             parsed = parsedate_to_datetime(value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return None
         return parsed.timestamp() - self._clock()
 

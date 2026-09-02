@@ -340,9 +340,7 @@ def test_unsupported_type_logged_and_skipped(tmp_path: Path) -> None:
 def test_batch_fetch_failure_marks_only_that_batchs_threads_failed(tmp_path: Path) -> None:
     thread_ids = [f"t{i}" for i in range(THREAD_BATCH_SIZE + 2)]
     contents = {tid: make_content(tid, tid) for tid in thread_ids}
-    client = simple_client(
-        contents, children=[thread_child(tid) for tid in thread_ids]
-    )
+    client = simple_client(contents, children=[thread_child(tid) for tid in thread_ids])
     failing_ids = {f"t{THREAD_BATCH_SIZE}", f"t{THREAD_BATCH_SIZE + 1}"}
 
     def side_effect(ids: Sequence[str]) -> dict[str, ThreadContent]:
@@ -365,9 +363,7 @@ def test_batch_fetch_failure_marks_only_that_batchs_threads_failed(tmp_path: Pat
 
 
 def test_blob_download_skipped_when_file_exists(tmp_path: Path) -> None:
-    content = make_content(
-        "doc1", "Doc", html="<p>See <img src='/blob/doc1/blobABC.png'/></p>"
-    )
+    content = make_content("doc1", "Doc", html="<p>See <img src='/blob/doc1/blobABC.png'/></p>")
     client = simple_client({"doc1": content})
     config = make_config(tmp_path)
     assets_dir = config.output_dir / "Private" / "_assets" / "doc1"
@@ -383,9 +379,7 @@ def test_blob_download_skipped_when_file_exists(tmp_path: Path) -> None:
 
 
 def test_blob_downloaded_when_missing(tmp_path: Path) -> None:
-    content = make_content(
-        "doc1", "Doc", html="<p>See <img src='/blob/doc1/blobABC'/></p>"
-    )
+    content = make_content("doc1", "Doc", html="<p>See <img src='/blob/doc1/blobABC'/></p>")
     client = simple_client({"doc1": content})
     client.blob_responses[("doc1", "blobABC")] = (b"\x89PNG", "image/png")
     config = make_config(tmp_path)
