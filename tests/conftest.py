@@ -43,17 +43,26 @@ def _is_notes_automation(command: object) -> bool:
     return executable == "open" and any("Notes" in part for part in parts[1:])
 
 
+#: Every way this codebase could start a subprocess. Guarding only
+#: `subprocess.run` would leave the net with holes: a future call through
+#: `Popen` or `os.system` would sail straight past it and reach the real app.
+_GUARDED_SUBPROCESS_CALLS = ("run", "Popen", "call", "check_call", "check_output")
+
+
 @pytest.fixture(autouse=True)
 def _block_real_notes_automation(monkeypatch: pytest.MonkeyPatch) -> None:
     """Fail any test that shells out to Notes instead of using a fake."""
-    real_run: Any = subprocess.run
 
-    def guarded_run(command: object, *args: Any, **kwargs: Any) -> Any:
-        if _is_notes_automation(command):
-            raise RealNotesAutomationAttempted(
-                "this test tried to drive the real Notes app "
-                f"({command!r}). Use a fake runner instead."
-            )
-        return real_run(command, *args, **kwargs)
+    def guard(name: str, real: Any) -> Any:
+        def guarded(command: object, *args: Any, **kwargs: Any) -> Any:
+            if _is_notes_automation(command):
+                raise RealNotesAutomationAttempted(
+                    "this test tried to drive the real Notes app "
+                    f"({command!r}) via subprocess.{name}. Use a fake runner instead."
+                )
+            return real(command, *args, **kwargs)
 
-    monkeypatch.setattr(subprocess, "run", guarded_run)
+        return guarded
+
+    for name in _GUARDED_SUBPROCESS_CALLS:
+        monkeypatch.setattr(subprocess, name, guard(name, getattr(subprocess, name)))
