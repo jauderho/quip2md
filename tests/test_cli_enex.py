@@ -13,6 +13,7 @@ monkeypatched to hand-written fakes, and `cli.QuipClient` to an in-memory one.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -580,3 +581,124 @@ def test_a_notes_error_during_an_applescript_import_returns_exit_code_2(
 
     assert cli.main(["import-notes", "--writer", "applescript", "--local"]) == 2
     assert "On My Mac" in capsys.readouterr().err
+
+
+# --- prune-notes: the CLI layer of the only destructive command -------------
+
+
+@dataclass
+class RecordingPruneRunner:
+    """Stands in for Notes; records what the CLI asked it to delete."""
+
+    folders: list[Any] = field(default_factory=list)
+    deleted_folders: list[str] = field(default_factory=list)
+    deleted_notes: list[str] = field(default_factory=list)
+
+    def resolve_account(self, *, local: bool) -> str:
+        return "iCloud"
+
+    def top_level_folders(self, account: str) -> list[Any]:
+        return list(self.folders)
+
+    def delete_folder(self, folder_id: str) -> None:
+        self.deleted_folders.append(folder_id)
+        self.folders = [f for f in self.folders if f.folder_id != folder_id]
+
+    def delete_note(self, note_id: str) -> None:
+        self.deleted_notes.append(note_id)
+
+
+def _install_prune_runner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, runner: RecordingPruneRunner
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "PruneRunner", lambda: runner)
+
+
+def test_prune_without_a_target_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Deleting nothing in particular is a mistake, not a default."""
+    _install_prune_runner(monkeypatch, tmp_path, RecordingPruneRunner())
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["prune-notes"])
+    assert exit_info.value.code == 2
+
+
+def test_prune_prints_a_plan_and_deletes_nothing_without_apply(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from quip2md.notes_prune import FolderInfo
+
+    runner = RecordingPruneRunner(folders=[FolderInfo("Imported Notes", "f1", 0, 0)])
+    _install_prune_runner(monkeypatch, tmp_path, runner)
+
+    assert cli.main(["prune-notes", "--empty-landing"]) == 0
+
+    out = capsys.readouterr().out
+    assert "nothing deleted" in out
+    assert "Imported Notes" in out
+    assert runner.deleted_folders == []
+
+
+def test_prune_with_apply_deletes_and_reports(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from quip2md.notes_prune import FolderInfo
+
+    runner = RecordingPruneRunner(folders=[FolderInfo("Imported Notes", "f1", 0, 0)])
+    _install_prune_runner(monkeypatch, tmp_path, runner)
+
+    assert cli.main(["prune-notes", "--empty-landing", "--apply"]) == 0
+
+    assert runner.deleted_folders == ["f1"]
+    assert "Prune complete." in capsys.readouterr().out
+
+
+def test_prune_reports_a_refusal_without_failing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from quip2md.notes_prune import FolderInfo
+
+    runner = RecordingPruneRunner(folders=[FolderInfo("Quip", "f1", 0, 2)])
+    _install_prune_runner(monkeypatch, tmp_path, runner)
+
+    assert cli.main(["prune-notes", "--folder", "Quip", "--apply"]) == 0
+
+    assert runner.deleted_folders == [], "the Quip folder is never deletable"
+    assert "protected" in capsys.readouterr().out
+
+
+def test_prune_exits_1_when_a_deletion_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from quip2md.notes_prune import FolderInfo
+
+    @dataclass
+    class FailingRunner(RecordingPruneRunner):
+        def delete_folder(self, folder_id: str) -> None:
+            raise RuntimeError("Notes said no")
+
+    runner = FailingRunner(folders=[FolderInfo("Imported Notes", "f1", 0, 0)])
+    _install_prune_runner(monkeypatch, tmp_path, runner)
+
+    assert cli.main(["prune-notes", "--empty-landing", "--apply"]) == 1
+
+
+def test_prune_surfaces_a_notes_error_as_exit_2(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    @dataclass
+    class RefusingRunner(RecordingPruneRunner):
+        def resolve_account(self, *, local: bool) -> str:
+            raise NotesError("Notes is not available")
+
+    _install_prune_runner(monkeypatch, tmp_path, RefusingRunner())
+    assert cli.main(["prune-notes", "--superseded", "--apply"]) == 2
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "abc"])
+def test_a_nonsensical_worker_count_is_rejected(bad: str) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["import-notes", "--workers", bad, "--dryrun"])
+    assert exit_info.value.code == 2
