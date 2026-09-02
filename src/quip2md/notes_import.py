@@ -93,14 +93,14 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from html import escape as html_escape
 from pathlib import Path
+from types import MappingProxyType
 from typing import Protocol
 
-import markdown as _markdown
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 from quip2md.config import DEFAULT_OUTPUT_DIR, Config
@@ -249,6 +249,8 @@ class NoteSource:
     quip_url: str | None
     body_markdown: str
     keyed_by_path: bool
+    created: str | None = None
+    updated: str | None = None
 
 
 def scan_source(source_dir: Path) -> list[NoteSource]:
@@ -290,6 +292,8 @@ def scan_source(source_dir: Path) -> list[NoteSource]:
                 quip_url=frontmatter.quip_url,
                 body_markdown=body,
                 keyed_by_path=keyed_by_path,
+                created=frontmatter.created,
+                updated=frontmatter.updated,
             )
         )
     return sources
@@ -317,6 +321,11 @@ def markdown_to_notes_html(
     degrade to a warning instead (see module docstring for the exact
     Notes-safe transformations applied).
     """
+    # Imported here, not at module scope: this legacy AppleScript writer is the
+    # only user of `python-markdown`, and the default `.enex` route pays half a
+    # second of start-up for it otherwise.
+    import markdown as _markdown
+
     warnings: list[str] = []
     fragment_html = _markdown.markdown(
         markdown_text, extensions=list(MARKDOWN_EXTENSIONS), tab_length=MARKDOWN_TAB_LENGTH
@@ -764,6 +773,10 @@ class NoteStateEntry:
     folder: str
     content_hash: str
     imported_at: str
+    #: Ids of earlier notes this entry replaced. The `.enex` route cannot
+    #: update a note in place, so a re-import creates a new note and the old
+    #: one is kept here (never deleted) for the user to remove by hand.
+    superseded_note_ids: tuple[str, ...] = ()
 
 
 class NotesState:
@@ -800,6 +813,11 @@ class NotesState:
             entries[key] = _parse_state_entry(self._path, key, value)
         self._entries = entries
 
+    @property
+    def entries(self) -> Mapping[str, NoteStateEntry]:
+        """Read-only view of every recorded note, for callers that must sweep."""
+        return MappingProxyType(self._entries)
+
     def get(self, key: str) -> NoteStateEntry | None:
         return self._entries.get(key)
 
@@ -810,15 +828,19 @@ class NotesState:
         """Persist current state atomically: write a temp file, then `os.replace`."""
         directory = self._path.parent
         directory.mkdir(parents=True, exist_ok=True)
-        payload = {
-            key: {
+        payload: dict[str, dict[str, object]] = {}
+        for key, entry in self._entries.items():
+            record: dict[str, object] = {
                 "note_id": entry.note_id,
                 "folder": entry.folder,
                 "content_hash": entry.content_hash,
                 "imported_at": entry.imported_at,
             }
-            for key, entry in self._entries.items()
-        }
+            # Written only when non-empty, so entries this writer produces stay
+            # byte-identical to the ones earlier versions wrote.
+            if entry.superseded_note_ids:
+                record["superseded_note_ids"] = list(entry.superseded_note_ids)
+            payload[key] = record
         fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=f".{self._path.name}.", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -846,8 +868,17 @@ def _parse_state_entry(path: Path, key: str, value: object) -> NoteStateEntry:
         and isinstance(imported_at, str)
     ):
         raise NotesStateError(f"Notes state at {path} has a malformed entry for {key!r}")
+    # Absent in files written before superseding was tracked (and in every
+    # entry the AppleScript writer produces): an empty tuple then.
+    superseded = value.get("superseded_note_ids", [])
+    if not (isinstance(superseded, list) and all(isinstance(item, str) for item in superseded)):
+        raise NotesStateError(f"Notes state at {path} has a malformed entry for {key!r}")
     return NoteStateEntry(
-        note_id=note_id, folder=folder, content_hash=content_hash, imported_at=imported_at
+        note_id=note_id,
+        folder=folder,
+        content_hash=content_hash,
+        imported_at=imported_at,
+        superseded_note_ids=tuple(superseded),
     )
 
 
