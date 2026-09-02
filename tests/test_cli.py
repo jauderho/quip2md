@@ -24,12 +24,18 @@ from pathlib import Path
 
 import pytest
 
-from quip2md import cli
+from quip2md import cli, notes_enex
 from quip2md.client import QuipFolder, QuipUser, ThreadContent
 from quip2md.config import Config
 from quip2md.convert import build_frontmatter
 from quip2md.export import ExportReport
 from quip2md.notes_import import ImportReport, NotesError
+
+
+@pytest.fixture(autouse=True)
+def _no_polling_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop the `.enex` landing-folder poll interval: the fakes answer at once."""
+    monkeypatch.setattr(notes_enex.time, "sleep", lambda _seconds: None)
 
 
 class _EmptyFakeQuipClient:
@@ -249,7 +255,7 @@ def test_import_notes_clean_run_returns_exit_code_0(
     _write_source_doc(tmp_path / "export", "Doc One.md", quip_id="AAA111", title="Doc One")
     monkeypatch.setattr(cli, "NotesRunner", _FakeNotesRunner)
 
-    exit_code = cli.main(["import-notes"])
+    exit_code = cli.main(["import-notes", "--writer", "applescript"])
 
     assert exit_code == 0
     captured = capsys.readouterr()
@@ -268,7 +274,7 @@ def test_import_notes_with_failure_returns_exit_code_1(
     _write_source_doc(tmp_path / "export", "Doc One.md", quip_id="AAA111", title="Doc One")
     monkeypatch.setattr(cli, "NotesRunner", _FailingCreateNotesRunner)
 
-    exit_code = cli.main(["import-notes"])
+    exit_code = cli.main(["import-notes", "--writer", "applescript"])
 
     assert exit_code == 1
     captured = capsys.readouterr()
@@ -285,7 +291,7 @@ def test_import_notes_non_macos_returns_exit_code_2(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "NotesRunner", _RaisingInitNotesRunner)
 
-    exit_code = cli.main(["import-notes"])
+    exit_code = cli.main(["import-notes", "--writer", "applescript"])
 
     assert exit_code == 2
     captured = capsys.readouterr()
@@ -304,7 +310,7 @@ def test_import_notes_corrupted_state_returns_exit_code_2(
     state_path.parent.mkdir(parents=True)
     state_path.write_text("{not valid json", encoding="utf-8")
 
-    exit_code = cli.main(["import-notes"])
+    exit_code = cli.main(["import-notes", "--writer", "applescript"])
 
     assert exit_code == 2
     captured = capsys.readouterr()
@@ -334,7 +340,7 @@ def test_import_notes_keyboard_interrupt_returns_exit_code_130(
 
     monkeypatch.setattr(cli, "run_import", fake_run_import)
 
-    exit_code = cli.main(["import-notes"])
+    exit_code = cli.main(["import-notes", "--writer", "applescript"])
 
     assert exit_code == 130
     captured = capsys.readouterr()
@@ -354,7 +360,7 @@ def test_import_notes_dryrun_prints_folder_counts_and_writes_no_state(
     _write_source_doc(source_dir, "Sub/Doc Two.md", quip_id="BBB222", title="Doc Two")
     monkeypatch.setattr(cli, "NotesRunner", _FakeNotesRunner)
 
-    exit_code = cli.main(["import-notes", "--dryrun"])
+    exit_code = cli.main(["import-notes", "--writer", "applescript", "--dryrun"])
 
     assert exit_code == 0
     captured = capsys.readouterr()
@@ -378,7 +384,7 @@ def test_import_notes_local_flag_passes_through_to_run_import(
     runner = _FakeNotesRunner()
     monkeypatch.setattr(cli, "NotesRunner", lambda: runner)
 
-    exit_code = cli.main(["import-notes", "--local"])
+    exit_code = cli.main(["import-notes", "--writer", "applescript", "--local"])
 
     assert exit_code == 0
     assert runner.resolve_account_calls == [True]
@@ -392,7 +398,7 @@ def test_import_notes_without_local_flag_targets_default_account(
     runner = _FakeNotesRunner()
     monkeypatch.setattr(cli, "NotesRunner", lambda: runner)
 
-    exit_code = cli.main(["import-notes"])
+    exit_code = cli.main(["import-notes", "--writer", "applescript"])
 
     assert exit_code == 0
     assert runner.resolve_account_calls == [False]
@@ -411,7 +417,7 @@ def test_import_notes_only_filters_to_the_given_key(
     runner = _FakeNotesRunner()
     monkeypatch.setattr(cli, "NotesRunner", lambda: runner)
 
-    exit_code = cli.main(["import-notes", "--only", "AAA111"])
+    exit_code = cli.main(["import-notes", "--writer", "applescript", "--only", "AAA111"])
 
     assert exit_code == 0
     captured = capsys.readouterr()
@@ -435,10 +441,110 @@ def test_import_notes_works_with_no_quip_token(
     _write_source_doc(tmp_path / "export", "Doc One.md", quip_id="AAA111", title="Doc One")
     monkeypatch.setattr(cli, "NotesRunner", _FakeNotesRunner)
 
-    exit_code = cli.main(["import-notes"])
+    exit_code = cli.main(["import-notes", "--writer", "applescript"])
 
     assert exit_code == 0
     captured = capsys.readouterr()
     assert "configuration error" not in captured.err
     assert "QUIP_TOKEN" not in captured.err
     assert "created:             1" in captured.out
+
+
+# --- import-notes: the .enex writer (default) --------------------------------
+
+
+class _FakeEnexRunner:
+    """Duck-typed fake for `notes_enex.EnexNotesRunnerProtocol`."""
+
+    def __init__(self) -> None:
+        self.opened: list[Path] = []
+        self.moved: list[tuple[str, str]] = []
+        self._imported = False
+
+    def resolve_account(self, *, local: bool) -> str:
+        del local
+        return "iCloud"
+
+    def folder_names(self, account: str) -> frozenset[str]:
+        del account
+        return frozenset({"Imported Notes"}) if self._imported else frozenset()
+
+    def get_or_create_folder(self, account: str, path: Sequence[str]) -> str:
+        del account
+        return "/".join(path)
+
+    def folder_id_by_name(self, account: str, name: str) -> str:
+        del account
+        return name
+
+    def notes_in_folder(self, folder_id: str):
+        del folder_id
+        from quip2md.notes_enex import ImportedNote
+
+        return [
+            ImportedNote("id-1", "Doc One", "<div>Source: <u>https://quip.com/AAA111</u></div>")
+        ]
+
+    def move_note(self, note_id: str, folder_id: str) -> None:
+        self.moved.append((note_id, folder_id))
+
+    def open_enex(self, path: Path) -> None:
+        self.opened.append(path)
+        self._imported = True
+
+
+def test_import_notes_enex_writer_is_the_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_source_doc(tmp_path / "export", "Doc One.md", quip_id="AAA111", title="Doc One")
+    monkeypatch.setattr(cli, "EnexNotesRunner", _FakeEnexRunner)
+
+    exit_code = cli.main(["import-notes"])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "Import complete." in captured.out
+    assert "filed into folders:  1" in captured.out
+    assert (tmp_path / ".quip2md" / "quip2md.enex").is_file()
+
+
+def test_import_notes_enex_dryrun_writes_the_archive_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_source_doc(
+        tmp_path / "export",
+        "Doc One.md",
+        quip_id="AAA111",
+        title="Doc One",
+        body="- [x] done\n  - [ ] child\n",
+    )
+
+    exit_code = cli.main(["import-notes", "--dryrun"])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "Dry run (no Notes changes)." in captured.out
+    assert "checklist items:     2" in captured.out
+    assert (tmp_path / ".quip2md" / "quip2md.enex").is_file()
+    assert not (tmp_path / ".quip2md" / "notes_state.json").exists()
+
+
+def test_import_notes_enex_reports_nested_checklists_needing_a_pass(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_source_doc(
+        tmp_path / "export",
+        "Doc One.md",
+        quip_id="AAA111",
+        title="Doc One",
+        body="- [x] parent\n  - [ ] child\n",
+    )
+    monkeypatch.setattr(cli, "EnexNotesRunner", _FakeEnexRunner)
+
+    exit_code = cli.main(["import-notes"])
+
+    assert exit_code == 0
+    assert "--indent-checklists" in capsys.readouterr().out
