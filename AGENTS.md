@@ -12,7 +12,7 @@ not suggestions.
 
 | Role | Rule |
 |---|---|
-| **Orchestrator** | **Fable Medium** if available; otherwise **Opus 4.8 High**. The orchestrator plans, decomposes, delegates, and reviews — it does not grind through bulk implementation itself. |
+| **Orchestrator** | **Fable Medium** if available; otherwise **Opus 5 High**. The orchestrator plans, decomposes, delegates, and reviews — it does not grind through bulk implementation itself. |
 | **Implementor** | Chosen **by the orchestrator, per task**. Optimize for *good over fast*. **Fable Low is the ceiling** for implementor models — never assign Fable Medium/High to implementation work. |
 | **When** | The orchestrator/implementor split is **mandatory for any complex task** (multi-step, multi-file, or requiring independent verification). Simple, single-step edits may be done directly by the orchestrator. |
 
@@ -22,7 +22,7 @@ model (Fable Low); mechanical or well-specified changes may use a faster model
 (e.g., Sonnet or Haiku). The orchestrator reviews all delegated output before
 accepting it.
 
-If Fable models are unavailable, Opus 4.8 High orchestrates and Opus 4.8 becomes
+If Fable models are unavailable, Opus 5 High orchestrates and Opus 5 becomes
 the implementor ceiling; Sonnet remains the default for well-specified work.
 
 **Self-escalation:** the orchestrator may raise itself to a higher model or
@@ -205,9 +205,11 @@ coding in this repo:
 | **`rg`** | Ripgrep — fast recursive text/code search. Default over `grep`/`find`. |
 | **`sg`** | ast-grep — structural (AST-aware) search and rewrite. Use for syntax-aware refactors that `rg` can't express safely. Use "outline" subcommand to get quick summary and steering |
 | **`tokei`** | Fast source code statistics by language. Quickly summarize repository size and composition. |
-| **`ty`** | Astral's fast Python type checker. |
+| **`ty`** | Fast Python type checker. |
 | **`ruff`** | Python linting + formatting. |
 | **`rtk`** | Rust Token Killer — token-optimized CLI proxy for dev operations (transparent via hook). |
+| **`shellcheck`** | Static analysis linter for shell scripts. Catches quoting bugs, unbound variables, and common bash pitfalls. | 
+| **`shfmt`** | Formatter for shell scripts. Enforces consistent indentation and style across bash/sh files. |
 | **`uv`** | Python package + standalone-script manager (PEP 723). The only Python package manager — never `pip`. |
 | **`xh`** | Friendly, modern replacement for `curl` for testing and exploring HTTP APIs. |
 | **`yq`** | `jq`-style processor for YAML, JSON, XML, TOML, and configuration files. Essential for GitHub Actions, Kubernetes, and Docker Compose. |
@@ -232,21 +234,23 @@ coding in this repo:
 - Leverage `match`, `TypeAlias`, `ParamSpec`, `typing.Self`, and `type X = ...` syntax.
 - `subprocess.run` with explicit `check=True`/`capture_output=True`. No `shell=True`.
 
-### Go (1.26+)
+### Go (1.27+)
 
 - `any` over `interface{}`. Use `slices`, `maps`, `cmp` stdlib packages.
-- Handle all errors explicitly. Use anonymous closures for `defer body.Close()` checks.
-- No ignored return values — code must be `errcheck`-clean.
+- Handle all errors explicitly. Use anonymous closures for `defer body.Close()` checks. No ignored return values — code must be `errcheck`-clean.
 - Flat package structure; only add layers when complexity demands it.
-- Range-over-func iterators where they simplify collection traversal.
+- Generic methods over package-level generic functions when the operation belongs to a specific type.
+- `encoding/json/v2` over `encoding/json` for new code.
+- Run `go fix` regularly to apply new modernizers; use range-over-func iterators where they simplify traversal.
 
-### Rust (1.96+)
+### Rust (1.98+)
 
 - `?` for error propagation. No `.unwrap()` in non-test code.
 - `thiserror` for library errors; `anyhow` for binaries.
 - `clippy` (all warnings as errors) and `rustfmt` before every commit.
 - `#[must_use]` on result-returning functions where ignoring is a likely mistake.
-- Prefer `impl Trait` in arguments; use const generics and `std::sync::LazyLock` for static.
+- Prefer `impl Trait` in arguments; use const generics and `std::sync::LazyLock` for statics.
+- Use let-chains and `if let` guards over nested `match`/`if` for multi-condition logic.
 
 ### TypeScript
 
@@ -308,3 +312,4 @@ coding in this repo:
 - [ ] Build/tests/lint/type check run, with results reported honestly (or "not run" stated)
 - [ ] No suppressed warnings, weakened tests, or debug leftovers in the diff
 - [ ] git commits are signed and use SSH keys for signing
+- [ ] Use concise ASD-STE100 Simplified Technical English for each commit message conveying only the most necessary information
