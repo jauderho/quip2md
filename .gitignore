@@ -5,6 +5,7 @@
 
 .quip2md/
 export/
+export*/
 
 # Python
 __pycache__/
