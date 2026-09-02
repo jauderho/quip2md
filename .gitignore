@@ -13,3 +13,7 @@ __pycache__/
 .venv/
 .pytest_cache/
 .ruff_cache/
+
+# Working review notes: kept locally, never committed.
+FEEDBACK.md
+REMEDIATION.md
