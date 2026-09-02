@@ -85,6 +85,7 @@ module or its test file ever shells out to `osascript`.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import json
 import logging
@@ -142,6 +143,39 @@ class NotesError(RuntimeError):
     def __init__(self, message: str, *, stderr: str = "") -> None:
         self.stderr = stderr
         super().__init__(f"{message}: {stderr}" if stderr else message)
+
+
+# --- Run lock ------------------------------------------------------------
+
+NOTES_LOCK_FILENAME = "notes.lock"
+
+
+@contextlib.contextmanager
+def notes_run_lock(state_dir: Path) -> Iterator[None]:
+    """Hold an exclusive lock for the duration of a run that changes Notes.
+
+    Two concurrent runs would each read the state file, each decide the same
+    documents are missing, and each import them -- duplicating the whole
+    library, which is the most expensive mistake this tool can make. An
+    advisory `flock` is used rather than a lock file with a pid in it, because
+    the kernel releases it when the process dies: a crashed run leaves nothing
+    stale behind for the next one to have to reason about.
+    """
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = state_dir / NOTES_LOCK_FILENAME
+    handle = path.open("w", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise NotesError(
+                "another quip2md run is already working on this Notes library "
+                f"(lock held on {path}). Wait for it to finish, or remove that "
+                "file if no run is active."
+            ) from exc
+        yield
+    finally:
+        handle.close()
 
 
 # --- Frontmatter parsing ---------------------------------------------------
@@ -262,7 +296,16 @@ def scan_source(source_dir: Path) -> list[NoteSource]:
     is keyed by `f"path:{relative_posix_path}"` instead -- a distinct
     namespace (the `path:` prefix) that can never collide with a real Quip
     thread id, so `NoteSource.keyed_by_path` tells callers which is which.
+
+    Raises `NotesError` when `source_dir` does not exist: a mistyped path must
+    not look like an export with nothing in it.
     """
+    if not source_dir.is_dir():
+        # A typo in --source otherwise reports a clean run over zero documents,
+        # which reads as success and is the one outcome a migration must never
+        # fake.
+        raise NotesError(f"no such source directory: {source_dir}")
+
     sources: list[NoteSource] = []
     for md_path in sorted(source_dir.rglob("*.md")):
         relative = md_path.relative_to(source_dir)
@@ -979,6 +1022,23 @@ def run_import(
         report.elapsed_seconds = time.monotonic() - start_time
         return report
 
+    # Everything past here writes to Notes and to the state file, so it runs
+    # under the same lock the `.enex` path takes: two concurrent runs would
+    # each decide the same notes are missing and create them twice.
+    with notes_run_lock(state_path.parent):
+        return _run_import_locked(runner, config, report, sources, state, local, start_time)
+
+
+def _run_import_locked(
+    runner: NotesRunnerProtocol,
+    config: Config,
+    report: ImportReport,
+    sources: Sequence[NoteSource],
+    state: NotesState,
+    local: bool,
+    start_time: float,
+) -> ImportReport:
+    """The half of `run_import()` that changes Notes. Holds the run lock."""
     account = runner.resolve_account(local=local)
 
     sources_by_folder: dict[tuple[str, ...], list[NoteSource]] = {}

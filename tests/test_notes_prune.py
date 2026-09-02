@@ -18,7 +18,8 @@ from pathlib import Path
 import pytest
 
 from quip2md.config import Config
-from quip2md.notes_prune import FolderInfo, prune_notes
+from quip2md.notes_import import NotesError
+from quip2md.notes_prune import FolderInfo, PruneRunner, prune_notes
 
 
 def _config(tmp_path: Path, *, dry_run: bool = False) -> Config:
@@ -257,3 +258,136 @@ def test_a_state_file_with_nothing_superseded_deletes_nothing(
     report = prune_notes(runner, _config(tmp_path), superseded=True, apply=True)
     assert runner.deleted_notes == []
     assert report.notes_deleted == 0
+
+
+# --- The real runner: the only code here that can destroy anything ----------
+
+
+@dataclass
+class FakeCompletedProcess:
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+
+
+def _stub_osascript(
+    monkeypatch: pytest.MonkeyPatch, *, returncode: int = 0, stdout: str = ""
+) -> list[list[str]]:
+    """Replace `subprocess.run` with a stub that cannot execute anything.
+
+    Stronger than `conftest.py`'s guard for these tests: there is no path to a
+    real process, and the command really is the `osascript` call under test.
+    """
+    from quip2md import notes_enex
+
+    seen: list[list[str]] = []
+
+    def fake_run(command: Sequence[str], *args: object, **kwargs: object) -> FakeCompletedProcess:
+        assert list(command)[:2] == ["osascript", "-e"], command
+        seen.append(list(command))
+        return FakeCompletedProcess(returncode=returncode, stdout=stdout)
+
+    monkeypatch.setattr(notes_enex.subprocess, "run", fake_run)
+    monkeypatch.setattr(notes_enex.sys, "platform", "darwin")
+    return seen
+
+
+def _runner() -> PruneRunner:
+    return PruneRunner()
+
+
+def test_top_level_folders_parses_the_record_and_field_separators(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_osascript(
+        monkeypatch,
+        stdout="Quip\x1ffolder-1\x1f0\x1f2\x1e   \x1eQuip-Old\x1ffolder-2\x1f492\x1f3\x1e",
+    )
+    folders = _runner().top_level_folders("iCloud")
+
+    assert folders == [
+        FolderInfo("Quip", "folder-1", 0, 2),
+        FolderInfo("Quip-Old", "folder-2", 492, 3),
+    ]
+
+
+def test_a_folder_line_that_is_not_numbers_is_an_error_not_a_guess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mis-reading a count could make a folder full of notes look empty."""
+    _stub_osascript(monkeypatch, stdout="Quip\x1ffolder-1\x1fmany\x1f2\x1e")
+    with pytest.raises(NotesError, match="could not read the folder list"):
+        _runner().top_level_folders("iCloud")
+
+
+def test_a_short_folder_record_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_osascript(monkeypatch, stdout="truncated\x1frecord\x1e")
+    assert _runner().top_level_folders("iCloud") == []
+
+
+def test_delete_folder_and_note_pass_the_id_through_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ids go over the process boundary as arguments, never interpolated."""
+    seen = _stub_osascript(monkeypatch)
+    runner = _runner()
+    runner.delete_folder("x-coredata://S/ICFolder/p1")
+    runner.delete_note("x-coredata://S/ICNote/p2")
+
+    assert seen[0][-1] == "x-coredata://S/ICFolder/p1"
+    assert seen[1][-1] == "x-coredata://S/ICNote/p2"
+    assert all("x-coredata" not in call[2] for call in seen), "id must not reach the script text"
+
+
+def test_the_delete_scripts_address_folders_and_notes_by_id() -> None:
+    from quip2md import notes_prune
+
+    assert "delete folder id (item 1 of argv)" in notes_prune._AS_DELETE_FOLDER
+    assert "delete note id (item 1 of argv)" in notes_prune._AS_DELETE_NOTE
+    # Top-level only: `folders of account` is flat, so the container must match.
+    assert "id of container of f) is accId" in notes_prune._AS_TOP_LEVEL_FOLDERS
+
+
+# --- The run lock -----------------------------------------------------------
+
+
+def test_a_second_run_cannot_prune_while_one_is_working(tmp_path: Path) -> None:
+    """Two concurrent runs would each act on a state file the other is changing."""
+    from quip2md.notes_import import notes_run_lock
+
+    _write_state(tmp_path, {"T1": _entry("live-1", superseded=["old-1"])})
+    runner = FakePruneRunner()
+
+    with notes_run_lock(tmp_path / ".quip2md"):
+        with pytest.raises(NotesError, match="another quip2md run"):
+            prune_notes(runner, _config(tmp_path), superseded=True, apply=True)
+
+    assert runner.deleted_notes == [], "nothing may be deleted while locked out"
+
+
+def test_a_plan_needs_no_lock(tmp_path: Path) -> None:
+    """Reading is always safe, so a dry run must never be blocked."""
+    from quip2md.notes_import import notes_run_lock
+
+    _write_state(tmp_path, {"T1": _entry("live-1", superseded=["old-1"])})
+    with notes_run_lock(tmp_path / ".quip2md"):
+        report = prune_notes(FakePruneRunner(), _config(tmp_path), superseded=True, apply=False)
+    assert report.notes_deleted == 1
+
+
+def test_the_lock_is_released_when_the_run_ends(tmp_path: Path) -> None:
+    from quip2md.notes_import import notes_run_lock
+
+    with notes_run_lock(tmp_path / ".quip2md"):
+        pass
+    with notes_run_lock(tmp_path / ".quip2md"):
+        pass  # a second acquisition must succeed
+
+
+def test_the_lock_is_released_even_when_the_run_raises(tmp_path: Path) -> None:
+    from quip2md.notes_import import notes_run_lock
+
+    with pytest.raises(RuntimeError), notes_run_lock(tmp_path / ".quip2md"):
+        raise RuntimeError("boom")
+    with notes_run_lock(tmp_path / ".quip2md"):
+        pass

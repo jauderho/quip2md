@@ -1190,3 +1190,71 @@ def test_a_failed_open_is_reported_rather_than_leaving_the_run_waiting(
     _stub_subprocess(monkeypatch, returncode=1, stderr="Unable to find application")
     with pytest.raises(NotesError, match="could not hand the .enex file to Notes"):
         EnexNotesRunner().open_enex(tmp_path / "quip2md.enex")
+
+
+def test_a_source_directory_that_does_not_exist_is_an_error(tmp_path: Path) -> None:
+    """A typo in --source must not read as a clean run over zero documents.
+
+    That is the one outcome a migration must never fake: the report would say
+    success, the archive would be empty, and nothing would say why.
+    """
+    with pytest.raises(NotesError, match="no such source directory"):
+        run_enex_import(
+            None,
+            _config(tmp_path, dry_run=True),
+            source_dir=tmp_path / "not-here",
+            enex_path=tmp_path / "out.enex",
+        )
+
+
+def test_an_existing_but_empty_source_directory_is_allowed(tmp_path: Path) -> None:
+    """An export tree with nothing in it is odd but not a mistake to refuse."""
+    empty = tmp_path / "export"
+    empty.mkdir()
+    report = run_enex_import(
+        None, _config(tmp_path, dry_run=True), source_dir=empty, enex_path=tmp_path / "out.enex"
+    )
+    assert report.documents == 0
+
+
+def test_a_second_import_cannot_run_while_one_is_working(tmp_path: Path) -> None:
+    """The worst mistake this tool can make is importing the corpus twice.
+
+    Two concurrent runs each read the state file, each conclude the same
+    documents are missing, and each import them.
+    """
+    from quip2md.notes_import import notes_run_lock
+
+    source = tmp_path / "export"
+    _write_doc(source, "A.md", quip_id="THREAD0013", url="https://quip.com/THREAD0013", title="A")
+    runner = FakeEnexRunner(
+        landing_notes=[ImportedNote("id-1", "A", _provenance("https://quip.com/THREAD0013"))]
+    )
+
+    with notes_run_lock(tmp_path / ".quip2md"):
+        with pytest.raises(NotesError, match="another quip2md run"):
+            run_enex_import(
+                runner,
+                _config(tmp_path),
+                source_dir=source,
+                enex_path=tmp_path / "o.enex",
+                confirm=False,
+            )
+
+    assert runner.opened == [], "nothing may be handed to Notes while locked out"
+    assert runner.moved == []
+
+
+def test_a_dry_run_is_never_blocked_by_the_lock(tmp_path: Path) -> None:
+    from quip2md.notes_import import notes_run_lock
+
+    source = tmp_path / "export"
+    _write_doc(source, "A.md", quip_id="THREAD0013", url="https://quip.com/THREAD0013", title="A")
+    with notes_run_lock(tmp_path / ".quip2md"):
+        report = run_enex_import(
+            None,
+            _config(tmp_path, dry_run=True),
+            source_dir=source,
+            enex_path=tmp_path / "o.enex",
+        )
+    assert report.documents == 1
