@@ -231,9 +231,14 @@ def _yaml_quote(value: str) -> str:
 
 
 def _strip_zero_width_space(soup: BeautifulSoup) -> None:
-    for text_node in soup.find_all(string=True):
-        if ZERO_WIDTH_SPACE in text_node:
-            text_node.replace_with(str(text_node).replace(ZERO_WIDTH_SPACE, ""))
+    # Snapshot first: the loop replaces nodes, which mutates the tree being walked.
+    affected = [
+        node
+        for node in soup.descendants
+        if isinstance(node, NavigableString) and ZERO_WIDTH_SPACE in node
+    ]
+    for text_node in affected:
+        text_node.replace_with(str(text_node).replace(ZERO_WIDTH_SPACE, ""))
 
 
 def _fix_list_nesting(soup: BeautifulSoup) -> None:
@@ -384,7 +389,13 @@ def _normalize_mentions(soup: BeautifulSoup) -> None:
     mentions collapse to plain text. Any element not matching a `mention`
     class token is left untouched -- the common case for every real fixture.
     """
-    for element in soup.find_all(None, attrs={"class": _MENTION_CLASS_RE}):
+    # Snapshot first: the loop replaces elements, which mutates the tree being walked.
+    mentions = [
+        node
+        for node in soup.descendants
+        if isinstance(node, Tag) and _MENTION_CLASS_RE.search(_attr_text(node.get("class")))
+    ]
+    for element in mentions:
         classes = _class_tokens(element)
         text = element.get_text()
         href = _attr_text(element.get("href")) if element.name == "a" else ""
