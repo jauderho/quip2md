@@ -281,6 +281,16 @@ Measured on the same real personal account (492 notes):
 - Immediate re-run (nothing changed): ~16 seconds, all 492 notes
   skipped-unchanged, zero duplicates.
 
+### Only one run at a time
+
+Any run that changes Notes takes an exclusive lock on `.quip2md/notes.lock`
+for its duration, and a second one refuses to start rather than queue. Two
+concurrent runs would each read the state file, each conclude the same
+documents are missing, and each import them — duplicating the library, which
+is the most expensive mistake this tool can make. The lock is advisory and
+held by the process, so a crashed run leaves nothing stale behind. Dry runs
+and `prune-notes` plans read only and are never blocked.
+
 ## Cleaning up after an import
 
 `import-notes` never deletes anything. A re-imported document leaves its
@@ -298,6 +308,10 @@ uv run quip2md prune-notes --superseded --empty-landing
 | `--empty-landing` | Delete every *empty* `Imported Notes N` folder. |
 | `--folder NAME` | Delete a named top-level folder and everything in it. Repeatable. Refuses anything that is not a top-level folder of the account, and refuses `Quip` outright. |
 | `--apply` | Actually delete. Without it the plan is printed and nothing is touched. |
+
+A mistyped `--source` is an error, not a run over zero documents: reporting
+success having done nothing is the one outcome a migration must never fake.
+
 
 Deleted notes and folders go to Notes' **Recently Deleted**, so this is
 recoverable for thirty days.
