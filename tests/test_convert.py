@@ -146,6 +146,93 @@ def test_ordered_list() -> None:
     assert "2. second" in result.markdown
 
 
+def test_numbered_list_is_recovered_from_section_style_6() -> None:
+    """Quip emits a numbered list as a <ul>; only the wrapper says otherwise."""
+    html = (
+        "<div class='' data-section-style='6' style=''><ul id='x'>"
+        "<li class='' id='1' style='' value='1'><span id='1'>Step one</span><br/></li>"
+        "<li class='' id='2' style=''><span id='2'>Step two</span><br/></li>"
+        "</ul></div>"
+    )
+    result = html_to_markdown(html, _default_resolver)
+    lines = [line.rstrip() for line in result.markdown.splitlines() if line.strip()]
+    assert lines == ["1. Step one", "2. Step two"]
+
+
+def test_checklist_from_section_style_7_marks_both_states() -> None:
+    """Real Quip markup: only checked items carry a class; unchecked are bare."""
+    html = (
+        "<div class='' data-section-style='7' style=''><ul id='x'>"
+        "<li class='checked' id='1' style='' value='1'><span id='1'>First task</span><br/></li>"
+        "<li class='' id='2' style=''><span id='2'>Second task</span><br/></li>"
+        "<li class='checked' id='3' style=''><span id='3'>Third task</span><br/></li>"
+        "</ul></div>"
+    )
+    result = html_to_markdown(html, _default_resolver)
+    lines = [line.rstrip() for line in result.markdown.splitlines() if line.strip()]
+    assert lines == ["- [x] First task", "- [ ] Second task", "- [x] Third task"]
+
+
+def test_nested_checklist_marks_every_depth() -> None:
+    """Sub-lists inherit the wrapper's style, in Quip's sibling-<ul> shape."""
+    html = (
+        "<div class='' data-section-style='7' style=''><ul id='x'>"
+        "<li class='parent' id='1' style='' value='1'><span id='1'>Parent item</span><br/></li>"
+        "<ul>"
+        "<li class='checked' id='2' style=''><span id='2'>Child item</span><br/></li>"
+        "<li class='' id='3' style=''><span id='3'>Kenji</span><br/></li>"
+        "<li class='checked parent' id='4' style=''><span id='4'>Fee</span><br/></li>"
+        "<ul><li class='checked' id='5' style=''><span id='5'>Paid</span><br/></li></ul>"
+        "</ul>"
+        "<li class='' id='6' style=''><span id='6'>NTTD</span><br/></li>"
+        "</ul></div>"
+    )
+    result = html_to_markdown(html, _default_resolver)
+    lines = [line.rstrip() for line in result.markdown.splitlines() if line.strip()]
+    assert lines == [
+        "- [ ] Parent item",
+        "  - [x] Child item",
+        "  - [ ] Kenji",
+        "  - [x] Fee",
+        "    - [x] Paid",
+        "- [ ] NTTD",
+    ]
+
+
+def test_bullet_list_section_style_5_is_left_alone() -> None:
+    html = (
+        "<div data-section-style='5'><ul id='x'>"
+        "<li class='' id='1' style=''><span id='1'>Plain</span><br/></li>"
+        "</ul></div>"
+    )
+    result = html_to_markdown(html, _default_resolver)
+    assert [line.rstrip() for line in result.markdown.splitlines() if line.strip()] == ["- Plain"]
+    assert result.warnings == ()
+
+
+def test_unknown_list_section_style_warns_but_keeps_text() -> None:
+    html = (
+        "<div data-section-style='99'><ul id='x'>"
+        "<li class='' id='1' style=''><span id='1'>Mystery</span><br/></li>"
+        "</ul></div>"
+    )
+    result = html_to_markdown(html, _default_resolver)
+    assert "- Mystery" in result.markdown
+    assert any("section style '99'" in warning for warning in result.warnings)
+
+
+def test_checklist_item_is_marked_once_only() -> None:
+    """A `checked` <li> inside a style-7 wrapper must not get a double marker."""
+    html = (
+        "<div data-section-style='7'><ul id='x'>"
+        "<li class='checked' id='1' style=''><span id='1'>Done</span><br/></li>"
+        "</ul></div>"
+    )
+    result = html_to_markdown(html, _default_resolver)
+    assert result.markdown.count("[x]") == 1
+    assert "[ ]" not in result.markdown
+
+
 def test_checklist_checked_and_unchecked() -> None:
     html = (
         "<ul>"
@@ -369,3 +456,27 @@ def test_asset_resolver_is_a_runtime_checkable_protocol_shape() -> None:
 
     resolver_typed: AssetResolver = resolver
     assert resolver_typed("t", "b", None) == "t/b"
+
+
+def test_empty_checklist_item_gets_no_marker() -> None:
+    """An empty Quip row must not become a stray empty checkbox."""
+    html = (
+        "<div data-section-style='7'><ul id='x'>"
+        "<li class='checked' id='1' style=''><span id='1'>Real</span><br/></li>"
+        "<li class='' id='2' style=''><span id='2'>​</span><br/></li>"
+        "</ul></div>"
+    )
+    result = html_to_markdown(html, _default_resolver)
+    lines = [line.rstrip() for line in result.markdown.splitlines() if line.strip()]
+    assert lines == ["- [x] Real"]
+
+
+def test_empty_parent_item_still_keeps_its_children() -> None:
+    html = (
+        "<div data-section-style='7'><ul id='x'>"
+        "<li class='parent' id='1' style=''><span id='1'>​</span><br/></li>"
+        "<ul><li class='checked' id='2' style=''><span id='2'>Child</span><br/></li></ul>"
+        "</ul></div>"
+    )
+    result = html_to_markdown(html, _default_resolver)
+    assert "[x] Child" in result.markdown

@@ -35,12 +35,16 @@ HTML payloads recorded by T1 in `docs/API_NOTES.md`):
   fencing it, bypassing markdownify entirely so code content is never
   markdown-escaped.
 
-Not observed in any fixture (no ordered lists, checklists, blockquotes,
-`<hr>`, `<del>`/`<s>`, or Quip `@`-mention markup exist in the recon sample):
-ordered-list, checklist, and mention handling below is implemented
-defensively against documented/plausible Quip conventions and exercised only
-by synthetic unit tests, not golden fixtures. Blockquote/hr/strikethrough are
-covered by markdownify's own (verified-by-unit-test) defaults.
+* A list's *kind* lives on the wrapping `<div data-section-style>`, never on
+  the list itself -- Quip emits `<ul>` for bullet, numbered *and* checklist
+  lists alike, and marks only checked checklist items with `class='checked'`.
+  `_normalize_lists` recovers the kind from that wrapper; see its docstring.
+
+Blockquotes, `<hr>` and Quip `@`-mention markup were not observed in any
+sampled thread; mention handling is implemented defensively against plausible
+Quip conventions and exercised only by synthetic unit tests. Blockquote/hr/
+strikethrough are covered by markdownify's own (verified-by-unit-test)
+defaults.
 """
 
 from __future__ import annotations
@@ -66,10 +70,20 @@ _IMAGE_EXT_RE = re.compile(r"\.(png|jpe?g|gif|webp|svg|bmp)(?:[?#].*)?$", re.IGN
 
 _LANG_CLASS_RE = re.compile(r"^lang(?:uage)?-([\w+-]+)$", re.IGNORECASE)
 
+# Unanchored, so searching the space-joined class attribute is equivalent to
+# bs4's per-token class matching (a match can never straddle the joining space).
 _MENTION_CLASS_RE = re.compile(r"mention", re.IGNORECASE)
 _MENTION_DATE_RE = re.compile(r"date", re.IGNORECASE)
 _CHECKED_CLASS_RE = re.compile(r"^checked$", re.IGNORECASE)
 _CHECKLIST_CLASS_RE = re.compile(r"checklist|unchecked", re.IGNORECASE)
+
+# Quip marks a list's *kind* on the wrapping `<div data-section-style>`, not on
+# the `<ul>`/`<li>` themselves -- every list it emits is a `<ul>` regardless of
+# how it renders. Values observed live across a 60-thread sample (T13 review):
+_SECTION_STYLE_ATTR = "data-section-style"
+_SECTION_STYLE_BULLET = "5"
+_SECTION_STYLE_NUMBERED = "6"
+_SECTION_STYLE_CHECKLIST = "7"
 
 MAX_TABLE_COLUMNS_BEFORE_WIDE = 30
 
@@ -148,7 +162,7 @@ def html_to_markdown(html: str, asset_resolver: AssetResolver) -> ConversionResu
 
     _strip_zero_width_space(soup)
     _fix_list_nesting(soup)
-    _normalize_checklists(soup)
+    _normalize_lists(soup, warnings)
     _normalize_mentions(soup)
     _normalize_images(soup, asset_resolver, warnings)
 
@@ -274,20 +288,92 @@ def _attr_text(value: str | list[str] | None) -> str:
     return value or ""
 
 
-def _normalize_checklists(soup: BeautifulSoup) -> None:
-    """Best-effort checklist detection (unverified: no fixture has one).
+def _normalize_lists(soup: BeautifulSoup, warnings: list[str]) -> None:
+    """Recover each list's kind from its wrapping `data-section-style` div.
 
-    Recognizes an `<li>` as a checked item when it carries a `checked` class
-    token, and as an unchecked checklist item when it carries a
-    `checklist`/`unchecked` class token, mirroring the `class='parent'`
-    convention Quip already uses on `<li>` for sub-list ownership.
+    Quip emits every list as a `<ul>` and records what it actually is on the
+    nearest enclosing `<div data-section-style>`: `5` bullets, `6` numbered,
+    `7` checklist. Two consequences that are only visible from the wrapper:
+
+    * a numbered list is indistinguishable from a bullet list at the `<ul>`
+      level, so style `6` lists are retagged as `<ol>` here;
+    * inside a checklist, only *checked* items carry a `checked` class token
+      -- an unchecked item's class is empty, making it identical to an
+      ordinary bullet. Every `<li>` under a style `7` list is therefore a
+      checklist item, and the absence of `checked` means unchecked, not
+      "not a checklist item".
+
+    Nested sub-lists inherit their ancestor div's style (verified: Quip keeps
+    the whole nested structure inside the one wrapper), which is why the style
+    is resolved per list via `find_parent` rather than per wrapper div.
+
+    A list under an unrecognized style is left as bullets and counted in
+    `warnings`, so a Quip list kind we have never seen surfaces in the run
+    report instead of silently degrading.
+
+    Must run after `_fix_list_nesting`: it relies on sub-lists already living
+    inside their owning `<li>` so that each `<li>` is visited exactly once, by
+    exactly one list.
     """
-    for li in soup.find_all("li"):
-        classes = _class_tokens(li)
-        if any(_CHECKED_CLASS_RE.match(c) for c in classes):
-            li.insert(0, "[x] ")
-        elif any(_CHECKLIST_CLASS_RE.search(c) for c in classes):
-            li.insert(0, "[ ] ")
+    unknown: Counter[str] = Counter()
+    for list_tag in soup.find_all(["ul", "ol"]):
+        style = _nearest_section_style(list_tag)
+        if style == _SECTION_STYLE_CHECKLIST:
+            for li in list_tag.find_all("li", recursive=False):
+                if _is_empty_item(li):
+                    # Quip keeps empty checklist rows; marking one would turn an
+                    # invisible spacer row into a stray empty checkbox. Leave it
+                    # bare so it collapses away exactly as an empty bullet does.
+                    continue
+                checked = any(_CHECKED_CLASS_RE.match(c) for c in _class_tokens(li))
+                li.insert(0, "[x] " if checked else "[ ] ")
+        elif style == _SECTION_STYLE_NUMBERED:
+            if list_tag.name == "ul":
+                list_tag.name = "ol"
+        elif style is None:
+            # No Quip wrapper at all (hand-written or synthetic HTML): fall
+            # back to the per-`<li>` class heuristic.
+            for li in list_tag.find_all("li", recursive=False):
+                _mark_checklist_item_by_class(li)
+        elif style != _SECTION_STYLE_BULLET:
+            unknown[style] += 1
+
+    for style, count in sorted(unknown.items()):
+        warnings.append(
+            f"unrecognized Quip list section style {style!r} ({count} list(s)): "
+            "converted as a bullet list"
+        )
+
+
+def _nearest_section_style(tag: Tag) -> str | None:
+    """The `data-section-style` of `tag`'s nearest enclosing wrapper div."""
+    ancestor = tag.find_parent(attrs={_SECTION_STYLE_ATTR: True})
+    if ancestor is None:
+        return None
+    return _attr_text(ancestor.get(_SECTION_STYLE_ATTR)).strip() or None
+
+
+def _is_empty_item(li: Tag) -> bool:
+    """True when a list item carries no content of its own (sub-lists aside)."""
+    for child in li.children:
+        if isinstance(child, Tag):
+            if child.name in ("ul", "ol"):
+                continue
+            if child.name == "img" or child.find("img") is not None:
+                return False
+            if child.get_text(strip=True):
+                return False
+        elif str(child).strip():
+            return False
+    return True
+
+
+def _mark_checklist_item_by_class(li: Tag) -> None:
+    classes = _class_tokens(li)
+    if any(_CHECKED_CLASS_RE.match(c) for c in classes):
+        li.insert(0, "[x] ")
+    elif any(_CHECKLIST_CLASS_RE.search(c) for c in classes):
+        li.insert(0, "[ ] ")
 
 
 def _normalize_mentions(soup: BeautifulSoup) -> None:

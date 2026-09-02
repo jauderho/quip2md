@@ -1,3 +1,3 @@
 # EX 9798
 
-- Qui odio
+- [ ] Qui odio
