@@ -18,6 +18,7 @@ import random
 import re
 from pathlib import Path
 
+import pytest
 from bs4 import BeautifulSoup, Tag
 
 from quip2md.convert import ZERO_WIDTH_SPACE, html_to_markdown
@@ -107,34 +108,52 @@ _MUTATORS = (
 )
 
 
-def test_fuzz_mutations_never_raise_and_never_lose_text() -> None:
+def _generate_cases() -> list[tuple[str, str, str]]:
+    """The mutation stream, drawn once at import in the historical draw order.
+
+    Kept identical to the original single-loop generation (same seed, same
+    sequence of `rng` draws) so the corpus of mutations under test does not
+    change; the cases are parametrized only so xdist can spread them.
+    """
     rng = random.Random(SEED)
     fixture_texts = {path: path.read_text(encoding="utf-8") for path in FIXTURE_PATHS}
     assert fixture_texts, "no fixtures found -- fuzz test would be vacuous"
 
-    for iteration in range(MUTATION_COUNT):
+    cases: list[tuple[str, str, str]] = []
+    for _ in range(MUTATION_COUNT):
         fixture_path = rng.choice(FIXTURE_PATHS)
         html = fixture_texts[fixture_path]
         mutator = rng.choice(_MUTATORS)
-        mutated_html = mutator(html, rng)
+        cases.append((fixture_path.name, mutator.__name__, mutator(html, rng)))
+    return cases
 
-        try:
-            result = html_to_markdown(mutated_html, _default_resolver)
-        except Exception as exc:  # noqa: BLE001 -- the assertion IS the failure mode
-            raise AssertionError(
-                f"iteration {iteration}: html_to_markdown raised {exc!r} on a "
-                f"{mutator.__name__} mutation of {fixture_path.name}"
-            ) from exc
 
-        soup = BeautifulSoup(mutated_html, "html.parser")
-        normalized_markdown = _normalize_for_comparison(result.markdown)
-        missing = [
-            normalized_node
-            for node in soup.find_all(string=True)
-            if (normalized_node := _normalize_for_comparison(str(node)))
-            and normalized_node not in normalized_markdown
-        ]
-        assert not missing, (
-            f"iteration {iteration}: visible text dropped by a "
-            f"{mutator.__name__} mutation of {fixture_path.name}: {missing[:5]!r}"
-        )
+_CASES = _generate_cases()
+_CASE_IDS = [
+    f"{index:03d}-{fixture_name.removesuffix('.html')}-{mutator_name.removeprefix('_mutate_')}"
+    for index, (fixture_name, mutator_name, _) in enumerate(_CASES)
+]
+
+
+@pytest.mark.parametrize(("fixture_name", "mutator_name", "mutated_html"), _CASES, ids=_CASE_IDS)
+def test_fuzz_mutation_never_raises_and_never_loses_text(
+    fixture_name: str, mutator_name: str, mutated_html: str
+) -> None:
+    try:
+        result = html_to_markdown(mutated_html, _default_resolver)
+    except Exception as exc:  # noqa: BLE001 -- the assertion IS the failure mode
+        raise AssertionError(
+            f"html_to_markdown raised {exc!r} on a {mutator_name} mutation of {fixture_name}"
+        ) from exc
+
+    soup = BeautifulSoup(mutated_html, "html.parser")
+    normalized_markdown = _normalize_for_comparison(result.markdown)
+    missing = [
+        normalized_node
+        for node in soup.find_all(string=True)
+        if (normalized_node := _normalize_for_comparison(str(node)))
+        and normalized_node not in normalized_markdown
+    ]
+    assert not missing, (
+        f"visible text dropped by a {mutator_name} mutation of {fixture_name}: {missing[:5]!r}"
+    )
