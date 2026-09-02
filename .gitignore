@@ -17,3 +17,7 @@ __pycache__/
 # Working review notes: kept locally, never committed.
 FEEDBACK.md
 REMEDIATION.md
+
+# Coverage artefacts from an ad-hoc run.
+.coverage
+.coverage.*
