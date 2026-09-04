@@ -199,6 +199,143 @@ def test_a_note_that_will_not_delete_stays_recorded(tmp_path: Path) -> None:
     assert state["T1"]["superseded_note_ids"] == ["old-b"]
 
 
+# --- Interruption / crash-consistency ---------------------------------------
+#
+# `except Exception` does not catch `KeyboardInterrupt`/`SystemExit` (both
+# `BaseException`), so a Ctrl-C mid-prune used to escape `_prune_superseded`
+# before `state.record(...)` (placed after the inner loop) and the trailing
+# `state.flush()` ran -- leaving already-deleted ids recorded as superseded so
+# the next `--apply` re-issued `delete note id X` against ids Notes no longer
+# held. These pin per-id persistence as the fix.
+
+
+@dataclass
+class InterruptingRunner:
+    """Succeeds `raise_after` deletes, then raises like a Ctrl-C mid-prune."""
+
+    folders: list[FolderInfo] = field(default_factory=list)
+    deleted_notes: list[str] = field(default_factory=list)
+    raise_after: int = 2
+    _count: int = 0
+
+    def resolve_account(self, *, local: bool) -> str:
+        return "iCloud"
+
+    def top_level_folders(self, account: str) -> list[FolderInfo]:
+        return list(self.folders)
+
+    def delete_folder(self, folder_id: str) -> None:
+        raise AssertionError("folders are not part of these tests")
+
+    def delete_note(self, note_id: str) -> None:
+        self._count += 1
+        if self._count > self.raise_after:
+            raise KeyboardInterrupt("interrupted mid-prune")
+        self.deleted_notes.append(note_id)
+
+
+def test_interrupted_prune_must_persist_already_deleted_ids(tmp_path: Path) -> None:
+    """A Ctrl-C after some deletes must not leave those ids still recorded.
+
+    Without per-id persistence the on-disk `notes_state.json` still listed ids
+    Notes had already moved to Recently Deleted, so the next `--apply` run
+    re-issued `delete note id X` against ids no longer in the live account.
+    """
+    _write_state(tmp_path, {"T1": _entry("live-1", superseded=["X", "Y", "Z"])})
+    runner = InterruptingRunner(raise_after=2)
+
+    with pytest.raises(KeyboardInterrupt):
+        prune_notes(runner, _config(tmp_path), superseded=True, apply=True)
+
+    assert runner.deleted_notes == ["X", "Y"]
+    on_disk = json.loads((tmp_path / ".quip2md" / "notes_state.json").read_text())
+    still_claimed = set(on_disk["T1"].get("superseded_note_ids", []))
+    already_deleted = set(runner.deleted_notes)
+    assert already_deleted.isdisjoint(still_claimed), (
+        f"State still records notes deleted from Notes as superseded: "
+        f"already-deleted={already_deleted}, still-recorded={still_claimed}"
+    )
+
+
+def test_interrupt_before_any_delete_leaves_state_unchanged(tmp_path: Path) -> None:
+    """No successful delete means nothing may have been removed from state.
+
+    Guards against an over-eager fix that records the entry with an empty
+    `kept` before any delete actually succeeds.
+    """
+    _write_state(tmp_path, {"T1": _entry("live-1", superseded=["X", "Y"])})
+    runner = InterruptingRunner(raise_after=0)
+
+    with pytest.raises(KeyboardInterrupt):
+        prune_notes(runner, _config(tmp_path), superseded=True, apply=True)
+
+    assert runner.deleted_notes == []
+    on_disk = json.loads((tmp_path / ".quip2md" / "notes_state.json").read_text())
+    assert on_disk["T1"]["superseded_note_ids"] == ["X", "Y"]
+
+
+def test_interrupted_prune_keeps_remaining_superseded_in_order(tmp_path: Path) -> None:
+    """Ids not yet deleted when the interrupt lands stay recorded, in order.
+
+    Guards against a fix that clears the whole entry on any interrupt rather
+    than only the ids already deleted; pins the original relative order of the
+    survivors.
+    """
+    _write_state(tmp_path, {"T1": _entry("live-1", superseded=["A", "B", "C", "D"])})
+    runner = InterruptingRunner(raise_after=2)
+
+    with pytest.raises(KeyboardInterrupt):
+        prune_notes(runner, _config(tmp_path), superseded=True, apply=True)
+
+    assert runner.deleted_notes == ["A", "B"]
+    on_disk = json.loads((tmp_path / ".quip2md" / "notes_state.json").read_text())
+    assert on_disk["T1"]["superseded_note_ids"] == ["C", "D"]
+
+
+def test_a_still_live_id_stays_recorded_when_a_later_delete_is_interrupted(
+    tmp_path: Path,
+) -> None:
+    """A skipped (still-current) id stays recorded even on a later interrupt.
+
+    Guards against a fix that drops the `note_id in live` skip branch from the
+    persisted entry: that branch must never cost a document its current note.
+    """
+    _write_state(
+        tmp_path,
+        {
+            "T1": _entry("live-1", superseded=["live-1", "X", "Y"]),
+            "T2": _entry("live-2"),
+        },
+    )
+    runner = InterruptingRunner(raise_after=1)
+
+    with pytest.raises(KeyboardInterrupt):
+        prune_notes(runner, _config(tmp_path), superseded=True, apply=True)
+
+    assert runner.deleted_notes == ["X"]
+    on_disk = json.loads((tmp_path / ".quip2md" / "notes_state.json").read_text())
+    assert on_disk["T1"]["superseded_note_ids"] == ["live-1", "Y"]
+
+
+def test_a_plan_interrupts_nothing_and_touches_no_state(tmp_path: Path) -> None:
+    """A plan (apply=False) never flushes, so the state file is byte-identical.
+
+    Guards against a fix that starts flushing inside the loop without also
+    gating it on `apply`, rewriting the state file for a dry run.
+    """
+    _write_state(tmp_path, {"T1": _entry("live-1", superseded=["X", "Y", "Z"])})
+    state_path = tmp_path / ".quip2md" / "notes_state.json"
+    before = state_path.read_bytes()
+    runner = InterruptingRunner(raise_after=2)  # would raise on apply, but never reached
+
+    report = prune_notes(runner, _config(tmp_path), superseded=True, apply=False)
+
+    assert report.applied is False
+    assert report.notes_deleted == 3
+    assert runner.deleted_notes == []
+    assert state_path.read_bytes() == before, "a plan must not rewrite the state file"
+
+
 def test_a_folder_that_comes_back_is_reported_as_a_failure(tmp_path: Path) -> None:
     """Notes does not persist deleting a folder that still holds notes.
 
