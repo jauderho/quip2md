@@ -222,6 +222,8 @@ def _export_one(
         logger.debug("skipping unchanged thread %s", item.thread_id)
         return
 
+    old_relative = manifest.path_for(item.thread_id)
+
     dir_path = config.output_dir.joinpath(*item.folder_path)
     dir_path.mkdir(parents=True, exist_ok=True)
     stem = sanitize_component(content.title or item.thread_id)
@@ -246,6 +248,23 @@ def _export_one(
         _write_xlsx_backup(client, item.thread_id, md_path, report)
 
     relative_path = _relative_posix(md_path, config.output_dir)
+    # A Quip thread whose title (or folder) changed between two exports
+    # sanitizes to a different basename, so `_NameAllocator` allocates a new
+    # file rather than overwriting the old one. `Manifest.record` below then
+    # re-points the single per-`thread_id` entry at the new path, but without
+    # this cleanup the previous `.md` would stay on disk carrying the same
+    # `quip_id` frontmatter -- an orphan `scan_source` returns as a *second*
+    # `NoteSource`, which (with `NotesState` keyed one-entry-per-`quip_id`)
+    # makes every default `import-notes` re-run re-import one note forever.
+    # Removing it only after the new write succeeds preserves the existing
+    # same-basename crash-orphan recovery (same path -> no unlink), and
+    # `os.path.samefile` guards the case-insensitive-filesystem case where a
+    # case-only title change makes `old_relative` and `relative_path` differ
+    # as strings but resolve to the same on-disk file.
+    if old_relative is not None and old_relative != relative_path:
+        old_abs = config.output_dir / Path(old_relative)
+        if old_abs.is_file() and not _same_file(old_abs, md_path):
+            old_abs.unlink()
     manifest.record(item.thread_id, relative_path, updated_usec, _iso8601_utc(exported_at))
     report.exported += 1
 
@@ -422,6 +441,23 @@ def _write_report_json(config: Config, report: ExportReport) -> None:
 
 def _relative_posix(path: Path, base: Path) -> str:
     return os.path.relpath(path, base).replace(os.sep, "/")
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    """True if `a` and `b` resolve to the same on-disk file (inode/device).
+
+    Used to keep a case-only title change on a case-insensitive filesystem
+    (where the old and new basenames are the same file) from deleting the
+    file that was just written: deleting it would drop the only on-disk copy
+    while a manifest entry for a now-missing file would be recorded.
+    """
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        # Missing path or a filesystem without stat (extremely rare) -- be
+        # non-destructive: treat them as the same file so the unlink is
+        # skipped rather than risking the just-written `.md`.
+        return False
 
 
 def _iso8601_utc(dt: datetime) -> str:
