@@ -271,6 +271,18 @@ class Manifest:
             return True
         return entry.updated_usec != updated_usec
 
+    def path_for(self, thread_id: str) -> str | None:
+        """The relative path currently recorded for `thread_id`, or `None`.
+
+        The single per-`thread_id` entry is what the exporter overwrites on a
+        re-export, so this is the authoritative "where this thread's `.md`
+        lived before this run" lookup -- used by `_export_one` to remove a
+        prior, differently-named file left behind when a Quip thread's title
+        (and thus its sanitized filename) changed between two exports.
+        """
+        entry = self._entries.get(thread_id)
+        return entry.path if entry is not None else None
+
     def record(self, thread_id: str, path: str, updated_usec: int, exported_at: str) -> None:
         """Record a successful export in memory; auto-flushes every N records."""
         self._entries[thread_id] = ManifestEntry(
