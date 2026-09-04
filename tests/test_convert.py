@@ -257,6 +257,49 @@ def test_code_block_without_language_hint() -> None:
     assert "```\necho hi\n```" in result.markdown
 
 
+def test_code_block_preserves_two_blank_lines() -> None:
+    """Two blank lines inside a fenced code block (PEP8 spacing) must survive.
+
+    Regression for the bug where `_tidy_blank_lines` ran *after* code-block
+    placeholders were substituted back, so its `\n{3,} -> \n\n` collapse ate
+    the second blank line of PEP8-style spacing inside the restored fence.
+    """
+    html = (
+        "<pre class='prettyprint lang-python'>def f():<br/>    pass<br/>"
+        "<br/><br/>def g():<br/>    pass<br/></pre>"
+    )
+    result = html_to_markdown(html, _default_resolver)
+    assert "```python\ndef f():\n    pass\n\n\ndef g():\n    pass\n```" in result.markdown
+
+
+def test_code_block_preserves_whitespace_only_line() -> None:
+    """A whitespace-only code line (indentation only) must be preserved verbatim.
+
+    Regression for the bug where `_tidy_blank_lines` ran *after* code-block
+    placeholders were substituted back, so its `line if line.strip() else ""`
+    branch blanked indentation-only lines inside the restored fence.
+    """
+    html = "<pre class='prettyprint'>a<br/>    <br/>b<br/></pre>"
+    result = html_to_markdown(html, _default_resolver)
+    assert "```\na\n    \nb\n```" in result.markdown
+
+
+def test_code_block_blank_lines_not_collapsed_amid_prose() -> None:
+    """Blank-line tidy still applies to surrounding prose with a code block.
+
+    Guarantees the reorder left the prose-cleaning behaviour intact: a run of
+    blank lines *outside* a fenced code block is still collapsed to a single
+    blank line, while the code block's own interior spacing is untouched.
+    """
+    html = (
+        "<p>before</p><p><br/></p><p><br/></p>"
+        "<pre class='prettyprint'>x<br/><br/><br/>y<br/></pre>"
+        "<p><br/></p><p><br/></p><p>after</p>"
+    )
+    result = html_to_markdown(html, _default_resolver)
+    assert result.markdown == "before\n\n```\nx\n\n\ny\n```\n\nafter\n"
+
+
 def test_blockquote() -> None:
     html = "<blockquote>Quoted text</blockquote>"
     result = html_to_markdown(html, _default_resolver)
