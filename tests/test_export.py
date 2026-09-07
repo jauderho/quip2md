@@ -137,7 +137,6 @@ def make_config(
         output_dir=output_dir if output_dir is not None else tmp_path / "export",
         state_path=state_path if state_path is not None else tmp_path / ".quip2md" / "state.json",
         dry_run=dry_run,
-        verbose=False,
         include_chats=include_chats,
         force=force,
     )

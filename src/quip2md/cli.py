@@ -437,7 +437,6 @@ def _main_export(args: argparse.Namespace) -> int:
         config = load_config(
             output_dir=args.output,
             dry_run=args.dryrun,
-            verbose=args.verbose,
             include_chats=args.include_chats,
             force=args.force,
         )
@@ -482,7 +481,6 @@ def _main_import_notes(args: argparse.Namespace) -> int:
         output_dir=DEFAULT_OUTPUT_DIR,
         state_path=DEFAULT_STATE_PATH,
         dry_run=args.dryrun,
-        verbose=args.verbose,
         include_chats=False,
         force=args.force,
     )
@@ -679,7 +677,6 @@ def _main_prune_notes(parser: argparse.ArgumentParser, args: argparse.Namespace)
         output_dir=DEFAULT_OUTPUT_DIR,
         state_path=DEFAULT_STATE_PATH,
         dry_run=not args.apply,
-        verbose=args.verbose,
         include_chats=False,
         force=False,
     )
