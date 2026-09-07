@@ -45,7 +45,6 @@ def _config(tmp_path: Path, *, dry_run: bool = False, force: bool = False) -> Co
         output_dir=tmp_path / "export",
         state_path=tmp_path / ".quip2md" / "state.json",
         dry_run=dry_run,
-        verbose=False,
         include_chats=False,
         force=force,
     )
