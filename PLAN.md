@@ -39,9 +39,9 @@ re-runnable (resume/incremental).
 ## 2. Model Contract — Assignments
 
 Per AGENTS.md: orchestrator = **Fable Medium** (fallback: Opus 4.8 High).
-Implementor ceiling = **Fable Low**. Orchestrator reviews every diff before accepting.
+Implementer ceiling = **Fable Low**. Orchestrator reviews every diff before accepting.
 
-| Task | Title | Implementor model | Why this model |
+| Task | Title | Implementer model | Why this model |
 |---|---|---|---|
 | T1 | API ground-truth recon | **Fable Low** | Exploratory, ambiguous, everything downstream depends on getting the facts right. |
 | T2 | Project scaffold + config | **Haiku 4.5** | Purely mechanical, fully specified. |
@@ -56,7 +56,7 @@ Ordering: T1 → T2 → (T3, T5 in parallel) → T4 → T6 → T7 → T8.
 T5 only needs T1's sample HTML fixtures, not the live client — hence parallelizable with T3.
 
 **Review gate after every task:** orchestrator reads the actual diff (not the
-implementor's summary), runs `uv run pytest`, `ruff check`, `ty check`
+implementer's summary), runs `uv run pytest`, `ruff check`, `ty check`
 independently, and rejects-with-sharper-prompt rather than hand-patching.
 
 ---
@@ -110,10 +110,10 @@ export/ tree mirroring Quip folders  +  export report (counts, failures, skips)
 
 ---
 
-## 4. Tasks — self-contained implementor prompts
+## 4. Tasks — self-contained implementer prompts
 
 Each block below is a ready-to-delegate prompt. Acceptance criteria are checkable
-by the implementor; the orchestrator re-verifies independently.
+by the implementer; the orchestrator re-verifies independently.
 
 ---
 
@@ -436,8 +436,8 @@ Notes with `export/` remaining the durable backup. Gated behind a new
 | Non-macOS / Notes unavailable | Clear error, exit 2 | |
 | Scale | ~492 notes; per-note osascript round-trips accepted (est. 5–15 min); batch multiple notes per osascript call only if T9 shows it's reliable | Correctness over speed; one-shot migration. |
 
-### Task assignments (same contract: orchestrator Fable, implementor ceiling Fable Low)
-| Task | Title | Implementor | Why |
+### Task assignments (same contract: orchestrator Fable, implementer ceiling Fable Low)
+| Task | Title | Implementer | Why |
 |---|---|---|---|
 | T9 | Apple Notes AppleScript recon | **Fable Low** | Exploratory; Notes automation folklore is unreliable; everything downstream depends on observed facts. |
 | T10 | Importer module (md→Notes HTML, osascript bridge, notes state) | **Fable Low** | Fidelity + subprocess/quoting safety + idempotency logic. |
