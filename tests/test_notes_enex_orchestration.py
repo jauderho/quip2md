@@ -427,7 +427,7 @@ def test_a_url_less_source_keyed_by_id_is_also_rejected(tmp_path: Path) -> None:
 
     `scan_source` keys by `quip_id` alone (with no check that `quip_url` is
     also present), so a corrupted export whose `quip_url` line was stripped
-    while its `quip_id` survived lands here too: keyed by id, `quip_url=None`.
+    while its `quip_id` survived lands here too: keyed by id, with quip_url unset.
     `keyed_by_path=False` reads as "a known Quip id, so it must have matched
     before," but the flag only records how it was keyed, and `_select_pending`
     re-renders such a source every run unless state was written -- which a
