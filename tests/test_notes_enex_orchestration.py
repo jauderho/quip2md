@@ -393,7 +393,15 @@ def test_two_documents_sharing_a_quip_url_collapse_to_the_last_one_scanned(
     assert set(_state(tmp_path)) == {"THREAD0014"}
 
 
-def test_only_accepts_a_path_key_for_a_file_without_frontmatter(tmp_path: Path) -> None:
+def test_only_rejects_a_url_less_path_keyed_source(tmp_path: Path) -> None:
+    """A `path:`-keyed file with no `quip_url` is refused, not rendered.
+
+    The .enex route matches each imported note back to its source by the URL
+    in its provenance line, so a source with no URL can never be matched,
+    filed, or recorded in `notes_state.json`. Letting it through would import
+    an orphan on every confirmed run, so it is failed loudly here and never
+    reaches the archive -- the run refuses without the side-effect.
+    """
     source = tmp_path / "export"
     (source / "Loose").mkdir(parents=True)
     (source / "Loose" / "Hand Written.md").write_text("just a body\n", encoding="utf-8")
@@ -407,8 +415,131 @@ def test_only_accepts_a_path_key_for_a_file_without_frontmatter(tmp_path: Path) 
         only=["path:Loose/Hand Written.md"],
     )
 
-    assert report.documents == 1
-    assert "<title>Hand Written</title>" in (tmp_path / "o.enex").read_text(encoding="utf-8")
+    assert report.documents == 0
+    assert report.enex_path == ""
+    assert not (tmp_path / "o.enex").exists()
+    assert [key for key, _reason in report.failed] == ["path:Loose/Hand Written.md"]
+    assert "quip_url" in report.failed[0][1]
+
+
+def test_a_url_less_source_keyed_by_id_is_also_rejected(tmp_path: Path) -> None:
+    """The invariant is `quip_url is None`, not `keyed_by_path`.
+
+    `scan_source` keys by `quip_id` alone (with no check that `quip_url` is
+    also present), so a corrupted export whose `quip_url` line was stripped
+    while its `quip_id` survived lands here too: keyed by id, `quip_url=None`.
+    `keyed_by_path=False` reads as "a known Quip id, so it must have matched
+    before," but the flag only records how it was keyed, and `_select_pending`
+    re-renders such a source every run unless state was written -- which a
+    url-less source can never be. The url guard catches both shapes.
+    """
+    source = tmp_path / "export"
+    corrupt = source / "Corrupt.md"
+    corrupt.parent.mkdir(parents=True, exist_ok=True)
+    corrupt.write_text(
+        "---\n"
+        'quip_id: "THREAD0013"\n'
+        'title: "Corrupt"\n'
+        'created: "2020-01-01T00:00:00Z"\n'
+        'updated: "2020-01-02T00:00:00Z"\n'
+        "---\n\nbody\n",
+        encoding="utf-8",
+    )
+
+    report = run_enex_import(
+        FakeEnexRunner(),
+        _config(tmp_path, dry_run=True),
+        source_dir=source,
+        enex_path=tmp_path / "o.enex",
+    )
+
+    assert report.documents == 0
+    assert [key for key, _reason in report.failed] == ["THREAD0013"]
+    assert "quip_url" in report.failed[0][1]
+    assert not (tmp_path / "o.enex").exists()
+
+
+def test_a_url_less_source_does_not_reimport_or_orphan_on_a_second_run(
+    tmp_path: Path,
+) -> None:
+    """The url guard is what makes a url-less source side-effect-idempotent.
+
+    A url-less source is refused and never recorded in `notes_state.json`, so
+    the skip-on-unchanged path (the only other thing that keeps a source out of
+    the archive) can never engage for it. The url guard is what keeps it out on
+    every run after that: a second run creates no orphan copy and contacts
+    Notes only for sources that do carry a URL.
+    """
+    source = tmp_path / "export"
+    (source / "Loose").mkdir(parents=True)
+    (source / "Loose" / "Hand Written.md").write_text("just a body\n", encoding="utf-8")
+    _write_doc(source, "A.md", quip_id="THREAD0013", url="https://quip.com/THREAD0013", title="A")
+
+    first_runner = FakeEnexRunner(
+        landing_notes=[ImportedNote("id-1", "A", _provenance("https://quip.com/THREAD0013"))]
+    )
+    archive = tmp_path / "o.enex"
+    first = run_enex_import(
+        first_runner, _config(tmp_path), source_dir=source, enex_path=archive, confirm=False
+    )
+
+    # The url-having source filed; the url-less one was refused, not orphaned.
+    # No "Hand Written" note was ever fabricated for the landing folder, so it
+    # never reached `report.unmatched` (the old orphan-forever path).
+    assert first.moved == 1
+    assert first.unmatched == []
+    assert first.imported == 1
+    assert [key for key, _reason in first.failed] == ["path:Loose/Hand Written.md"]
+    assert "quip_url" in first.failed[0][1]
+    assert set(_state(tmp_path)) == {"THREAD0013"}
+    assert archive.exists(), "the first run wrote the archive for the url-having source"
+
+    # Drop the first run's archive so the second run's "wrote nothing" is clean
+    # to assert -- the run never deletes the file, the early return simply
+    # does not rewrite it.
+    archive.unlink()
+
+    # Second run: A is unchanged (skipped), Hand Written is refused again, and
+    # because nothing is pending no archive is written and Notes is never opened.
+    second_runner = FakeEnexRunner()
+    second = run_enex_import(
+        second_runner, _config(tmp_path), source_dir=source, enex_path=archive, confirm=False
+    )
+
+    assert second.documents == 0
+    assert second.skipped_unchanged == 1
+    assert second.moved == 0
+    assert second.unmatched == []
+    assert second.imported == 0
+    assert second.enex_path == ""
+    assert [key for key, _reason in second.failed] == ["path:Loose/Hand Written.md"]
+    assert second_runner.opened == [], "nothing pending means Notes is never contacted"
+    assert not archive.exists(), "nothing pending means no archive is written"
+    assert set(_state(tmp_path)) == {"THREAD0013"}, "the url-less source is never recorded"
+
+
+def test_only_rejects_a_urlless_source_even_under_force(tmp_path: Path) -> None:
+    """`--force` reimports unchanged documents, not url-less ones.
+
+    A url-less source is refused on a structural ground (no match key), not a
+    content one, so force does not apply to it: the archive is still not
+    written for it, and it is still reported as failed.
+    """
+    source = tmp_path / "export"
+    (source / "Loose").mkdir(parents=True)
+    (source / "Loose" / "Hand Written.md").write_text("just a body\n", encoding="utf-8")
+
+    report = run_enex_import(
+        FakeEnexRunner(),
+        _config(tmp_path, dry_run=True, force=True),
+        source_dir=source,
+        enex_path=tmp_path / "o.enex",
+    )
+
+    assert report.documents == 0
+    assert report.skipped_unchanged == 0  # force skips nothing; the guard is not the skip
+    assert [key for key, _reason in report.failed] == ["path:Loose/Hand Written.md"]
+    assert not (tmp_path / "o.enex").exists()
 
 
 def test_only_matching_nothing_writes_no_archive_at_all(tmp_path: Path) -> None:

@@ -780,9 +780,29 @@ def _select_pending(
     so it has to stay reachable after the import that created the note has
     already been recorded -- otherwise the only way to indent an existing note
     would be to re-import it, which would duplicate it.
+
+    A source with no `quip_url` is refused before it reaches the archive. This
+    route matches an imported note back to its source by the URL in the note's
+    provenance line, so a url-less source (a hand-written `path:`-keyed file, or
+    a corrupted export whose `quip_url` was stripped while its `quip_id`
+    survived) can never be matched, filed, or recorded in `notes_state.json`.
+    Letting it through would import an orphan note on every operator-confirmed
+    run -- recorded in no state file, so the skip-on-unchanged path can never
+    engage for it -- so it fails loudly here and never reaches the archive.
+    Unlike the unchanged-skip, this guard is structural, not content-based, so
+    `force` does not override it.
     """
     pending: list[tuple[NoteSource, NoteEnml]] = []
     for source, note in rendered:
+        if not source.quip_url:
+            report.failed.append(
+                (
+                    source.key,
+                    "no quip_url: the .enex import route matches notes back by "
+                    "their provenance URL and cannot file a source without one",
+                )
+            )
+            continue
         entry = state.get(source.key)
         unchanged = entry is not None and entry.content_hash == _content_hash(
             source.title, note.enml

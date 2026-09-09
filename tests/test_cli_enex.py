@@ -257,6 +257,39 @@ def test_unmatched_notes_return_exit_code_1_and_name_their_folder(
     assert "- Stray Note" in captured.out
 
 
+def test_a_url_less_source_surfaces_under_failed_and_exits_1_not_unmatched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A url-less source is refused before the archive, so it never reaches Notes.
+
+    Pinned at the CLI layer because the failure channel matters: the url-less
+    source is reported under `failed:` (a refused input) and not under
+    `unmatched (left in ...)`, so the operator is told the source itself must
+    be fixed rather than handed a note name to hunt for in the landing folder.
+    A normal source alongside it still imports cleanly, so a mixed tree exits 1
+    without leaving the url-less source as an orphan.
+    """
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "export"
+    (source / "Loose").mkdir(parents=True)
+    (source / "Loose" / "Hand Written.md").write_text("just a body\n", encoding="utf-8")
+    _write_source_doc(source, "A.md", quip_id="THREAD0013", title="A")
+    runner = _matching_runner(("THREAD0013", "A"))
+    monkeypatch.setattr(cli, "EnexNotesRunner", lambda: runner)
+
+    assert cli.main(["import-notes"]) == 1
+    captured = capsys.readouterr()
+    out = captured.out
+    assert "failed:              1" in out
+    assert "path:Loose/Hand Written.md" in out
+    assert "quip_url" in out
+    # A url-less source is a refused input, not an orphan left in the landing
+    # folder: it never reached Notes, so the unmatched channel is silent.
+    assert "unmatched (left in" not in out
+    # The url-having source alongside it still filed into its folder.
+    assert runner.moved == [("id-1", "folder:Quip")]
+
+
 def test_a_second_run_with_nothing_changed_writes_no_archive(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
