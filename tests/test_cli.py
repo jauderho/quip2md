@@ -299,6 +299,30 @@ def test_import_notes_non_macos_returns_exit_code_2(
     assert "macOS" in captured.err
 
 
+def test_import_notes_dryrun_skips_platform_guard_on_non_macos(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # `--dryrun` must not construct `NotesRunner` (whose `__init__` raises on
+    # non-macOS); it should scan+convert offline and exit 0, the same contract
+    # the enex writer honours on a non-macOS box. `_RaisingInitNotesRunner`
+    # simulates the non-darwin platform guard -- if the dry run ever builds
+    # the runner, this test fails with exit 2 instead of 0.
+    monkeypatch.chdir(tmp_path)
+    _write_source_doc(tmp_path / "export", "Doc One.md", quip_id="AAA111", title="Doc One")
+    monkeypatch.setattr(cli, "NotesRunner", _RaisingInitNotesRunner)
+
+    exit_code = cli.main(["import-notes", "--writer", "applescript", "--dryrun"])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "Dry run: notes import" in captured.out
+    assert "no Notes automation calls were made" in captured.out
+    assert "would create:        1" in captured.out
+    assert captured.err == ""
+    assert not (tmp_path / ".quip2md" / "notes_state.json").exists()
+    assert not (tmp_path / ".quip2md" / "last_notes_run.json").exists()
+
+
 def test_import_notes_corrupted_state_returns_exit_code_2(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
