@@ -174,10 +174,14 @@ def html_to_markdown(html: str, asset_resolver: AssetResolver) -> ConversionResu
     converter = MarkdownConverter(heading_style=ATX, bullets="-")
     markdown = converter.convert_soup(soup)
 
+    # Tidy blank lines *before* restoring code/table placeholders. Placeholders
+    # are alnum-only single lines, so the tidy pass here only ever touches
+    # surrounding prose -- running it *after* substitution would rewrite the
+    # interior of just-restored fenced code blocks, collapsing 2+ blank lines
+    # (e.g. PEP8 spacing) and blanking whitespace-only code lines.
+    markdown = _tidy_blank_lines(markdown)
     for placeholder, replacement in {**code_placeholders, **table_placeholders}.items():
         markdown = markdown.replace(placeholder, replacement)
-
-    markdown = _tidy_blank_lines(markdown)
 
     return ConversionResult(markdown=markdown, warnings=tuple(warnings), wide_table=wide_table)
 
