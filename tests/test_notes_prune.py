@@ -391,3 +391,99 @@ def test_the_lock_is_released_even_when_the_run_raises(tmp_path: Path) -> None:
         raise RuntimeError("boom")
     with notes_run_lock(tmp_path / ".quip2md"):
         pass
+
+
+# --- Ctrl-C during an apply: state is flushed so a re-run resumes ------------
+
+
+@dataclass
+class InterruptingPruneRunner(FakePruneRunner):
+    """Simulates the user hitting Ctrl-C after the Nth note is deleted."""
+
+    interrupt_after: int = 1
+
+    def delete_note(self, note_id: str) -> None:
+        self.deleted_notes.append(note_id)
+        if len(self.deleted_notes) == self.interrupt_after:
+            raise KeyboardInterrupt
+
+
+def test_an_interrupt_during_apply_flushes_state_so_the_rerun_resumes(
+    tmp_path: Path,
+) -> None:
+    """A Ctrl-C after one id is deleted must not leave it recorded as superseded.
+
+    `_prune_superseded` flushes after every id, so an interrupt between ids
+    leaves `notes_state.json` consistent with what Notes actually did: the
+    already-deleted id is gone from the superseded set, and the re-run resumes
+    at the next id rather than re-issuing deletes for ids the interrupted run
+    already processed.
+    """
+    _write_state(tmp_path, {"T1": _entry("live-1", superseded=["old-1", "old-2"])})
+    runner = InterruptingPruneRunner(interrupt_after=1)
+
+    with pytest.raises(KeyboardInterrupt):
+        prune_notes(runner, _config(tmp_path), superseded=True, apply=True)
+
+    assert runner.deleted_notes == ["old-1"], "exactly one delete was issued before Ctrl-C"
+    state = json.loads((tmp_path / ".quip2md" / "notes_state.json").read_text())
+    assert state["T1"]["note_id"] == "live-1", "the live note must survive untouched"
+    assert state["T1"]["superseded_note_ids"] == ["old-2"], (
+        "old-1 is already gone from Notes; the flushed state must say so"
+    )
+
+    rerun = FakePruneRunner()
+    report = prune_notes(rerun, _config(tmp_path), superseded=True, apply=True)
+    assert rerun.deleted_notes == ["old-2"], "the re-run must not re-delete old-1"
+    assert report.notes_deleted == 1
+    state = json.loads((tmp_path / ".quip2md" / "notes_state.json").read_text())
+    assert state["T1"].get("superseded_note_ids", []) == [], (
+        "after the re-run the key has no superseded ids left"
+    )
+
+
+def test_an_interrupt_between_keys_persists_the_done_key_and_pending_ids(
+    tmp_path: Path,
+) -> None:
+    """A fully-done key stays done; an interrupted key keeps its later ids pending."""
+    _write_state(
+        tmp_path,
+        {
+            "T1": _entry("live-1", superseded=["old-a"]),
+            "T2": _entry("live-2", superseded=["old-b", "old-c"]),
+        },
+    )
+    runner = InterruptingPruneRunner(interrupt_after=2)  # Ctrl-C on the 2nd delete (old-b)
+
+    with pytest.raises(KeyboardInterrupt):
+        prune_notes(runner, _config(tmp_path), superseded=True, apply=True)
+
+    assert runner.deleted_notes == ["old-a", "old-b"]
+    state = json.loads((tmp_path / ".quip2md" / "notes_state.json").read_text())
+    assert state["T1"].get("superseded_note_ids", []) == [], (
+        "T1 was fully done before the interrupt"
+    )
+    assert state["T2"]["superseded_note_ids"] == ["old-c"], (
+        "old-b was consumed when Ctrl-C hit; old-c was never reached and stays pending"
+    )
+
+    rerun = FakePruneRunner()
+    report = prune_notes(rerun, _config(tmp_path), superseded=True, apply=True)
+    assert rerun.deleted_notes == ["old-c"], "T1 done, old-b done; only old-c remains"
+    assert report.notes_deleted == 1
+    state = json.loads((tmp_path / ".quip2md" / "notes_state.json").read_text())
+    assert state["T2"].get("superseded_note_ids", []) == []
+
+
+def test_an_interrupt_during_an_apply_releases_the_run_lock(tmp_path: Path) -> None:
+    """A second run must be able to acquire the lock after an interrupted one."""
+    from quip2md.notes_import import notes_run_lock
+
+    _write_state(tmp_path, {"T1": _entry("live-1", superseded=["old-1", "old-2"])})
+    runner = InterruptingPruneRunner(interrupt_after=1)
+
+    with pytest.raises(KeyboardInterrupt):
+        prune_notes(runner, _config(tmp_path), superseded=True, apply=True)
+
+    with notes_run_lock(tmp_path / ".quip2md"):
+        pass  # the lock must have been released on the way out of the interrupted run

@@ -698,6 +698,17 @@ def _main_prune_notes(parser: argparse.ArgumentParser, args: argparse.Namespace)
     except _cli.NotesError as exc:
         print(f"quip2md: Notes error: {exc}", file=sys.stderr)
         return 2
+    except KeyboardInterrupt:
+        # `prune_notes` flushes notes_state.json after every id it deletes (see
+        # `_prune_superseded`), so the contract the module docstring prints for
+        # exit 130 holds here too: a re-run resumes at the next id rather than
+        # re-issuing deletes for notes the interrupted run already removed.
+        print(
+            "\nquip2md: prune interrupted. .quip2md/notes_state.json has "
+            "been flushed; re-run the same command to finish pruning.",
+            file=sys.stderr,
+        )
+        return 130
 
     print("Prune complete." if args.apply else "Prune plan (nothing deleted; pass --apply).")
     print(f"  notes deleted:     {report.notes_deleted}")
