@@ -191,31 +191,39 @@ def _prune_superseded(
     state.load()
     live = {entry.note_id for entry in state.entries.values()}
 
-    for key, entry in list(state.entries.items()):
-        if not entry.superseded_note_ids:
-            continue
-        kept: list[str] = []
-        for note_id in entry.superseded_note_ids:
-            if note_id in live:
-                # Paranoia, not decoration: deleting a note that is also some
-                # document's current copy would destroy live data.
-                report.skipped.append((note_id, "still the current note for a document"))
-                kept.append(note_id)
+    # Persist before moving to the next id, so an interrupting BaseException
+    # (Ctrl-C / SystemExit -- not caught by the per-note `except Exception`
+    # inside the loop) cannot leave the on-disk state claiming as superseded
+    # an id Notes has already moved to Recently Deleted. Mirrors
+    # `_run_import_locked`'s per-batch `record` + `finally: flush()`: the
+    # per-id `record` is the load-bearing part, since a bare `try/finally`
+    # around the loop would persist an unchanged entry otherwise.
+    try:
+        for key, entry in list(state.entries.items()):
+            if not entry.superseded_note_ids:
                 continue
-            if not apply:
+            kept: list[str] = list(entry.superseded_note_ids)
+            for note_id in entry.superseded_note_ids:
+                if note_id in live:
+                    # Paranoia, not decoration: deleting a note that is also some
+                    # document's current copy would destroy live data.
+                    report.skipped.append((note_id, "still the current note for a document"))
+                    continue
+                if not apply:
+                    report.notes_deleted += 1
+                    continue
+                try:
+                    runner.delete_note(note_id)
+                except Exception as exc:  # broad by design: per-note failure isolation
+                    report.failed.append((note_id, str(exc)))
+                    continue
                 report.notes_deleted += 1
-                continue
-            try:
-                runner.delete_note(note_id)
-            except Exception as exc:  # broad by design: per-note failure isolation
-                report.failed.append((note_id, str(exc)))
-                kept.append(note_id)
-                continue
-            report.notes_deleted += 1
+                kept.remove(note_id)
+                state.record(key, _without_superseded(entry, kept))
+                state.flush()
+    finally:
         if apply:
-            state.record(key, _without_superseded(entry, kept))
-    if apply:
-        state.flush()
+            state.flush()
 
 
 def _without_superseded(entry: NoteStateEntry, kept: Sequence[str]) -> NoteStateEntry:
