@@ -76,7 +76,7 @@ ALLOWED_LINK_SCHEMES = ("https://", "http://", "mailto:", "tel:")
 _TASK_MARKER_RE = re.compile(r"^\[([ xX])\](?:\s+|$)")
 
 #: Characters XML 1.0 cannot carry at all. One of them anywhere in the payload
-#: makes the whole `.enex` unparseable, so they are dropped at every escape
+#: makes the whole `.enex` unparsable, so they are dropped at every escape
 #: point. Tab, LF and CR are legal and deliberately absent from the class.
 _XML_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 
