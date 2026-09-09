@@ -194,11 +194,12 @@ class NoteFrontmatter:
     title: str | None
     created: str | None
     updated: str | None
+    exported: str | None = None
 
 
 _FRONTMATTER_DELIMITER = "---"
 _NO_FRONTMATTER = NoteFrontmatter(
-    quip_id=None, quip_url=None, title=None, created=None, updated=None
+    quip_id=None, quip_url=None, title=None, created=None, updated=None, exported=None
 )
 
 
@@ -241,6 +242,7 @@ def parse_frontmatter(text: str) -> tuple[NoteFrontmatter, str]:
             title=fields.get("title"),
             created=fields.get("created"),
             updated=fields.get("updated"),
+            exported=fields.get("exported"),
         ),
         body,
     )
@@ -285,6 +287,11 @@ class NoteSource:
     keyed_by_path: bool
     created: str | None = None
     updated: str | None = None
+    #: The `exported` frontmatter timestamp (`build_frontmatter` writes one per
+    #: export run). Used by `scan_source` to disambiguate two `.md` files that
+    #: share a `quip_id` -- the latest export's file wins so a pre-fix rename
+    #: orphan stops churning the single `NotesState` slot for that id.
+    exported: str | None = None
 
 
 def scan_source(source_dir: Path) -> list[NoteSource]:
@@ -296,6 +303,13 @@ def scan_source(source_dir: Path) -> list[NoteSource]:
     is keyed by `f"path:{relative_posix_path}"` instead -- a distinct
     namespace (the `path:` prefix) that can never collide with a real Quip
     thread id, so `NoteSource.keyed_by_path` tells callers which is which.
+
+    Two `.md` files that share a `quip_id` (a Quip thread whose title -- and
+    thus sanitized filename -- changed between two exports, where the old
+    file was left on disk) are collapsed to a single, canonical `NoteSource`
+    so a stale rename orphan cannot churn `NotesState`'s one-entry-per-id slot
+    on every re-run. Path-keyed sources (no `quip_id`) are never collapsed:
+    each is unique by construction.
 
     Raises `NotesError` when `source_dir` does not exist: a mistyped path must
     not look like an export with nothing in it.
@@ -337,9 +351,76 @@ def scan_source(source_dir: Path) -> list[NoteSource]:
                 keyed_by_path=keyed_by_path,
                 created=frontmatter.created,
                 updated=frontmatter.updated,
+                exported=frontmatter.exported,
             )
         )
-    return sources
+    return _collapse_duplicate_quip_ids(sources)
+
+
+def _collapse_duplicate_quip_ids(sources: Sequence[NoteSource]) -> list[NoteSource]:
+    """Collapse same-`quip_id` sources down to a single canonical `NoteSource`.
+
+    `NotesState` stores exactly one entry per `quip_id`, and `_select_pending`
+    compares each source's rendered hash against that one entry. With two
+    sources sharing a `quip_id` but differing titles/content (a rename orphan
+    left by a pre-fix exporter), at most one can match state per run; the
+    other is always pending, so a default re-import churns a new note every
+    run forever. Collapsing to one source removes the alternation at its
+    root: the export tree's stale copy is ignored rather than re-imported.
+
+    Path-keyed sources (no `quip_id`) are passed through unchanged -- they
+    are unique by path and have no single-state-slot hazard. Non-duplicated
+    `quip_id` sources pass through unchanged too, so normal one-file-per-doc
+    trees are untouched.
+    """
+    groups: dict[str, list[NoteSource]] = {}
+    for source in sources:
+        if source.keyed_by_path:
+            continue
+        groups.setdefault(source.key, []).append(source)
+    winners = {key: _pick_canonical(group) for key, group in groups.items() if len(group) > 1}
+    if not winners:
+        return list(sources)
+
+    emitted: set[str] = set()
+    result: list[NoteSource] = []
+    for source in sources:
+        if source.keyed_by_path or source.key not in winners:
+            result.append(source)
+            continue
+        if source.key in emitted:
+            continue
+        result.append(winners[source.key])
+        emitted.add(source.key)
+    return result
+
+
+def _pick_canonical(group: Sequence[NoteSource]) -> NoteSource:
+    """Choose the canonical `NoteSource` among same-`quip_id` files.
+
+    The exporter records exactly one `.md` per `quip_id` at a time; a rename
+    re-export left the old-titled file alongside the new one, so the
+    canonical copy is the **latest export's file** -- the one with the
+    newest `exported` frontmatter timestamp (`build_frontmatter` writes one
+    per run). `updated` (Quip's own `updated_usec`) does *not* change on a
+    pure title rename, so it cannot break the tie; `exported` always does.
+    Sub-second re-exports share the second-granularity `exported` stamp, so
+    ties fall to the newest file mtime (the newer export is written second).
+    Any remaining tie is broken by the smallest relative path so the choice
+    never depends on scan order, keeping it stable across re-runs (which is
+    the whole point: a stable choice stops the churn).
+    """
+    scored: list[tuple[NoteSource, str, int]] = []
+    for source in group:
+        try:
+            mtime_ns = source.md_path.stat().st_mtime_ns
+        except OSError:
+            mtime_ns = 0
+        scored.append((source, source.exported or "", mtime_ns))
+    ranked = sorted(scored, key=lambda item: (item[1], item[2]), reverse=True)
+    top_exported, top_mtime = ranked[0][1], ranked[0][2]
+    finalists = [item[0] for item in ranked if item[1] == top_exported and item[2] == top_mtime]
+    return min(finalists, key=lambda source: source.relative_path)
 
 
 # --- Markdown -> Notes HTML conversion --------------------------------------

@@ -421,6 +421,63 @@ def test_manifest_should_export_persists_across_reload(tmp_path: Path) -> None:
     assert reloaded.should_export("t1", 999) is True
 
 
+# --- Manifest: path_for ---------------------------------------------------
+
+
+def test_manifest_path_for_returns_recorded_path(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    manifest = Manifest(config)
+    manifest.load()
+    manifest.record("t1", "Private/Foo.md", 100, "2026-01-01T00:00:00Z")
+
+    assert manifest.path_for("t1") == "Private/Foo.md"
+
+
+def test_manifest_path_for_returns_none_for_unknown_thread(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    manifest = Manifest(config)
+    manifest.load()
+    manifest.record("t1", "Private/Foo.md", 100, "2026-01-01T00:00:00Z")
+
+    assert manifest.path_for("missing") is None
+
+
+def test_manifest_path_for_returns_none_on_empty_manifest(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    manifest = Manifest(config)
+    manifest.load()
+
+    assert manifest.path_for("anything") is None
+
+
+def test_manifest_path_for_tracks_re_record(tmp_path: Path) -> None:
+    # The exporter overwrites the single per-thread_id slot on a rename
+    # re-export; `path_for` must follow that overwrite so the prior path can
+    # be cleaned up. This is the lookup `_export_one` relies on.
+    config = make_config(tmp_path)
+    manifest = Manifest(config)
+    manifest.load()
+    manifest.record("t1", "Private/Foo.md", 100, "2026-01-01T00:00:00Z")
+    manifest.record("t1", "Private/Bar.md", 100, "2026-01-02T00:00:00Z")
+
+    assert manifest.path_for("t1") == "Private/Bar.md"
+
+
+def test_manifest_path_for_reflects_loaded_state(tmp_path: Path) -> None:
+    # `path_for` reads the in-memory entries populated by `load()`, so a
+    # reloaded manifest reports the path previously flushed to disk.
+    config = make_config(tmp_path)
+    manifest = Manifest(config)
+    manifest.load()
+    manifest.record("t1", "Private/Flushed.md", 100, "2026-01-01T00:00:00Z")
+    manifest.flush()
+
+    reloaded = Manifest(make_config(tmp_path))
+    reloaded.load()
+
+    assert reloaded.path_for("t1") == "Private/Flushed.md"
+
+
 # --- Manifest: atomic writes + auto-flush ---------------------------------
 
 
