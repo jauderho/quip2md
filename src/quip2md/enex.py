@@ -76,7 +76,7 @@ ALLOWED_LINK_SCHEMES = ("https://", "http://", "mailto:", "tel:")
 _TASK_MARKER_RE = re.compile(r"^\[([ xX])\](?:\s+|$)")
 
 #: Characters XML 1.0 cannot carry at all. One of them anywhere in the payload
-#: makes the whole `.enex` unparseable, so they are dropped at every escape
+#: makes the whole `.enex` unparsable, so they are dropped at every escape
 #: point. Tab, LF and CR are legal and deliberately absent from the class.
 _XML_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 
@@ -342,20 +342,29 @@ def _render_list(list_tag: Tag, state: _RenderState, *, depth: int) -> None:
 
 
 def _render_native_list_item(li: Tag, state: _RenderState, *, depth: int) -> str:
+    out: list[str] = []
     inline_parts: list[str] = []
-    sublists: list[str] = []
+
+    def _flush_inline() -> None:
+        joined = "".join(inline_parts).strip()
+        if joined:
+            out.append(joined)
+        inline_parts.clear()
+
     for child in li.contents:
         if isinstance(child, Tag) and child.name in ("ul", "ol"):
+            _flush_inline()
             nested = _RenderState(md_dir=state.md_dir, resources=state.resources)
             _render_list(child, nested, depth=depth + 1)
-            sublists.extend(nested.blocks)
+            out.append("".join(nested.blocks))
             state.checklist.extend(nested.checklist)
             state.warnings.extend(nested.warnings)
         elif isinstance(child, Tag) and child.name == "p":
             inline_parts.append(_render_inline(child, state))
         else:
             inline_parts.append(_render_inline_node(child, state))
-    return f"<li>{''.join(inline_parts).strip()}{''.join(sublists)}</li>"
+    _flush_inline()
+    return f"<li>{''.join(out)}</li>"
 
 
 def _render_checklist(list_tag: Tag, state: _RenderState, *, depth: int) -> None:
