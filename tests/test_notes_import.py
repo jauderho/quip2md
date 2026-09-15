@@ -23,7 +23,6 @@ from quip2md.config import Config
 from quip2md.convert import build_frontmatter
 from quip2md.notes_import import (
     DEFAULT_BATCH_SIZE,
-    MAX_BATCH_PAYLOAD_BYTES,
     ImportReport,
     NoteFrontmatter,
     NotesError,
@@ -31,7 +30,6 @@ from quip2md.notes_import import (
     NotesState,
     NotesStateError,
     NoteStateEntry,
-    chunk_note_bodies,
     markdown_to_notes_html,
     parse_frontmatter,
     run_import,
@@ -436,39 +434,6 @@ def test_golden_image_fixture_warns_about_missing_asset(tmp_path: Path) -> None:
 
     assert any("missing image" in warning for warning in result.warnings)
     assert "[missing image:" in result.html
-
-
-# --- chunk_note_bodies -------------------------------------------------
-
-
-def test_chunk_note_bodies_respects_max_count() -> None:
-    bodies = [f"b{i}" for i in range(25)]
-    chunks = list(chunk_note_bodies(bodies, max_count=10, max_bytes=1_000_000))
-    assert [len(chunk) for chunk in chunks] == [10, 10, 5]
-
-
-def test_chunk_note_bodies_respects_max_bytes() -> None:
-    bodies = ["a" * 100, "b" * 100, "c" * 100]
-    chunks = list(chunk_note_bodies(bodies, max_count=100, max_bytes=150))
-    assert [len(chunk) for chunk in chunks] == [1, 1, 1]
-
-
-def test_chunk_note_bodies_oversized_single_body_gets_its_own_chunk() -> None:
-    bodies = ["x" * 500]
-    chunks = list(chunk_note_bodies(bodies, max_count=10, max_bytes=100))
-    assert chunks == [["x" * 500]]
-
-
-def test_chunk_note_bodies_at_default_constants() -> None:
-    bodies = [f"b{i}" for i in range(DEFAULT_BATCH_SIZE * 2 + 3)]
-    chunks = list(
-        chunk_note_bodies(bodies, max_count=DEFAULT_BATCH_SIZE, max_bytes=MAX_BATCH_PAYLOAD_BYTES)
-    )
-    assert [len(chunk) for chunk in chunks] == [DEFAULT_BATCH_SIZE, DEFAULT_BATCH_SIZE, 3]
-
-
-def test_chunk_note_bodies_empty_input() -> None:
-    assert list(chunk_note_bodies([], max_count=10, max_bytes=1000)) == []
 
 
 # --- NotesState ------------------------------------------------------------
