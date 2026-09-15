@@ -22,7 +22,6 @@ import quip2md.notes_import as notes_import
 from quip2md.config import Config
 from quip2md.convert import build_frontmatter
 from quip2md.notes_import import (
-    DEFAULT_BATCH_SIZE,
     ImportReport,
     NoteFrontmatter,
     NotesError,
