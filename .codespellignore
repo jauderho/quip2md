@@ -1,0 +1,9 @@
+# Latin lorem-ipsum words that appear in test fixtures (intentional test data)
+nam
+habitant
+ridiculus
+varius
+# Rust technical term: static variables / lazy statics
+statics
+# macOS terminal emulator product name
+iTerm

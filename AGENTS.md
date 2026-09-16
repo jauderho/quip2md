@@ -13,36 +13,36 @@ not suggestions.
 | Role | Rule |
 |---|---|
 | **Orchestrator** | **Fable Medium** if available; otherwise **Opus 5 High**. The orchestrator plans, decomposes, delegates, and reviews — it does not grind through bulk implementation itself. |
-| **Implementor** | Chosen **by the orchestrator, per task**. Optimize for *good over fast*. **Fable Low is the ceiling** for implementor models — never assign Fable Medium/High to implementation work. |
-| **When** | The orchestrator/implementor split is **mandatory for any complex task** (multi-step, multi-file, or requiring independent verification). Simple, single-step edits may be done directly by the orchestrator. |
+| **Implementer** | Chosen **by the orchestrator, per task**. Optimize for *good over fast*. **Fable Low is the ceiling** for implementer models — never assign Fable Medium/High to implementation work. |
+| **When** | The orchestrator/implementer split is **mandatory for any complex task** (multi-step, multi-file, or requiring independent verification). Simple, single-step edits may be done directly by the orchestrator. |
 
-Implementor selection guidance: match the model to the task's difficulty — subtle
+Implementer selection guidance: match the model to the task's difficulty — subtle
 refactors, tricky debugging, or security-sensitive code get the strongest permitted
 model (Fable Low); mechanical or well-specified changes may use a faster model
 (e.g., Sonnet or Haiku). The orchestrator reviews all delegated output before
 accepting it.
 
 If Fable models are unavailable, Opus 5 High orchestrates and Opus 5 becomes
-the implementor ceiling; Sonnet remains the default for well-specified work.
+the implementer ceiling; Sonnet remains the default for well-specified work.
 
 **Self-escalation:** the orchestrator may raise itself to a higher model or
 reasoning effort (e.g., Fable Medium → Fable High) when it judges the task demands
 it — deep architectural decisions, subtle concurrency or security analysis, or a
 problem that has resisted two rounds of delegation. Escalation must be deliberate:
 state the reason when escalating, and drop back once the hard part is done. The
-implementor ceiling is unaffected — escalation applies to the orchestrator seat only.
+implementer ceiling is unaffected — escalation applies to the orchestrator seat only.
 
 ### Delegation Protocol
 
 The orchestrator's leverage is in the prompt and the review — not in trusting the
-implementor.
+implementer.
 
 - **Write self-contained subtask prompts.** Include exact file paths, the intended
   behavior change, hard constraints ("do not touch X"), and acceptance criteria the
-  implementor can check itself. A subtask that needs the orchestrator's conversation
+  implementer can check itself. A subtask that needs the orchestrator's conversation
   context to make sense is under-specified.
 - **One coherent change per subtask.** If the description contains "and also", split it.
-- **Review the diff, not the report.** Implementor summaries are optimistic. Read the
+- **Review the diff, not the report.** Implementer summaries are optimistic. Read the
   actual changes and run the checks independently before accepting.
 - **Reject and re-delegate with a sharper prompt** rather than hand-patching bad
   output — hand-patching hides the misunderstanding that produced it, and it will
