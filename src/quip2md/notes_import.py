@@ -382,6 +382,22 @@ def _collapse_duplicate_quip_ids(sources: Sequence[NoteSource]) -> list[NoteSour
     if not winners:
         return list(sources)
 
+    for quip_id, group in groups.items():
+        if len(group) <= 1:
+            continue
+        canonical = winners[quip_id]
+        orphan_paths = [
+            s.relative_path for s in group if s.relative_path != canonical.relative_path
+        ]
+        logger.warning(
+            "quip_id %r has %d files on disk; keeping %r, ignoring orphan(s): %s. "
+            "Re-run `quip2md export` (or delete the orphan files) to clean up permanently.",
+            quip_id,
+            len(group),
+            canonical.relative_path,
+            ", ".join(repr(p) for p in orphan_paths),
+        )
+
     emitted: set[str] = set()
     result: list[NoteSource] = []
     for source in sources:
