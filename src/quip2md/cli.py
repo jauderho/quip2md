@@ -97,9 +97,9 @@ Exit codes:
          configuration, manifest, or Notes-state error (e.g. `QUIP_TOKEN`
          missing for `export`; a corrupted `.quip2md/state.json` or
          `.quip2md/notes_state.json`; an API error during the initial
-         folder walk; or, for `import-notes`, a non-macOS platform or a
-         missing "On My Mac" account) -- a clear message is printed to
-         stderr, no traceback.
+         folder walk; or, for `import-notes` on a real (non-`--dryrun`)
+         run, a non-macOS platform or a missing "On My Mac" account) -- a
+         clear message is printed to stderr, no traceback.
     130  interrupted (Ctrl-C). The manifest/state file has already been
          flushed; re-running the same command resumes from where it left
          off.
@@ -121,7 +121,7 @@ from quip2md.config import DEFAULT_OUTPUT_DIR, DEFAULT_STATE_PATH, Config, Confi
 if TYPE_CHECKING:  # imported for type hints only; see `__getattr__` below
     from quip2md.export import ExportReport
     from quip2md.notes_enex import EnexImportReport, EnexNotesRunnerProtocol
-    from quip2md.notes_import import ImportReport
+    from quip2md.notes_import import ImportReport, NotesRunnerProtocol
     from quip2md.notes_indent import IndentReport
 
 _LOG_FORMAT = "%(levelname)s %(name)s: %(message)s"
@@ -490,11 +490,13 @@ def _main_import_notes(args: argparse.Namespace) -> int:
     if args.writer == "enex":
         return _main_import_notes_enex(args, config)
 
-    try:
-        runner = _cli.NotesRunner()
-    except _cli.NotesError as exc:
-        print(f"quip2md: Notes error: {exc}", file=sys.stderr)
-        return 2
+    runner: NotesRunnerProtocol | None = None
+    if not config.dry_run:
+        try:
+            runner = _cli.NotesRunner()
+        except _cli.NotesError as exc:
+            print(f"quip2md: Notes error: {exc}", file=sys.stderr)
+            return 2
 
     try:
         report: ImportReport = _cli.run_import(
