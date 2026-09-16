@@ -1,16 +1,13 @@
 # Lorem ipsum Latin in test fixtures and golden files
 habitant
 nam
-NAM
 ridiculus
-Ridiculus
 varius
-Varius
 # Role name in AGENTS.md (orchestrator/implementor split)
 implementor
 # Rust term in AGENTS.md (std::sync::LazyLock for statics)
 statics
 # Application name in README.md
-iTerm
+iterm
 # Accepted variant spelling, used in enex.py
 unparseable
