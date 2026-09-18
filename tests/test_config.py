@@ -55,7 +55,6 @@ def test_config_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
 
     assert config.base_url == "https://platform.quip.com"
     assert config.dry_run is False
-    assert config.verbose is False
     assert config.include_chats is False
     assert config.force is False
 
