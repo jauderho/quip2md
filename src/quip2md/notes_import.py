@@ -574,15 +574,6 @@ def _chunk_by_size[T](
         yield chunk
 
 
-def chunk_note_bodies(
-    bodies: Sequence[str], *, max_count: int, max_bytes: int
-) -> Iterator[list[str]]:
-    """Chunk note-body strings for one `osascript` batch-create call each."""
-    yield from _chunk_by_size(
-        bodies, size_of=lambda b: len(b.encode("utf-8")), max_count=max_count, max_bytes=max_bytes
-    )
-
-
 # AppleScript snippets. Every handler is `on run argv ... end run`; content
 # (account/folder names, note bodies, ids) always crosses the process
 # boundary via `argv`, never interpolated into the script text -- matching
