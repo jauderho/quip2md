@@ -12,6 +12,7 @@ monkeypatched to hand-written fakes, and `cli.QuipClient` to an in-memory one.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -702,3 +703,93 @@ def test_a_nonsensical_worker_count_is_rejected(bad: str) -> None:
     with pytest.raises(SystemExit) as exit_info:
         cli.main(["import-notes", "--workers", bad, "--dryrun"])
     assert exit_info.value.code == 2
+
+
+# --- prune-notes: Ctrl-C is handled like the other subcommands --------------
+
+
+def _write_prune_state(tmp_path: Path, entries: dict[str, dict[str, object]]) -> Path:
+    path = tmp_path / ".quip2md" / "notes_state.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(entries), encoding="utf-8")
+    return path
+
+
+def _prune_entry(note_id: str, *, superseded: Sequence[str] = ()) -> dict[str, object]:
+    return {
+        "note_id": note_id,
+        "folder": "Quip",
+        "content_hash": "h",
+        "imported_at": "2026-01-01T00:00:00Z",
+        "superseded_note_ids": list(superseded),
+    }
+
+
+def test_prune_notes_keyboard_interrupt_returns_exit_code_130(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A Ctrl-C while pruning is handled, not surfaced as a traceback (exit 130).
+
+    Mirrors `test_import_notes_keyboard_interrupt_returns_exit_code_130` and
+    `test_ctrl_c_during_an_enex_import_returns_exit_code_130`: every subcommand
+    handler catches `KeyboardInterrupt` and returns 130 with a friendly
+    message, so the console-script wrapper never shows a raw traceback. Prune
+    had been the lone exception, so the interrupt escaped `cli.main()`.
+    """
+    _install_prune_runner(monkeypatch, tmp_path, RecordingPruneRunner())
+
+    def raises(*args: Any, **kwargs: Any) -> Any:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "prune_notes", raises)
+
+    assert cli.main(["prune-notes", "--superseded", "--apply"]) == 130
+    captured = capsys.readouterr()
+    assert "prune interrupted" in captured.err
+    assert "notes_state.json" in captured.err
+
+
+@dataclass
+class InterruptingPruneRunner(RecordingPruneRunner):
+    """Simulates the user hitting Ctrl-C after the first note is deleted."""
+
+    def delete_note(self, note_id: str) -> None:
+        self.deleted_notes.append(note_id)
+        if len(self.deleted_notes) == 1:
+            raise KeyboardInterrupt
+
+
+def test_prune_notes_ctrl_c_flushes_state_and_a_rerun_resumes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The exit-130 contract the module docstring prints must hold for prune.
+
+    On Ctrl-C mid-`--apply`: a friendly message + exit 130 + a flushed
+    `.quip2md/notes_state.json` that already reflects what Notes has done, so
+    a re-run resumes at the next id instead of re-issuing deletes for ids the
+    interrupted run already processed (the "user is misled" harm from the bug
+    report: the re-run re-deleted `old-1` and counted it as newly deleted).
+    """
+    monkeypatch.chdir(tmp_path)
+    _write_prune_state(tmp_path, {"T1": _prune_entry("live-1", superseded=("old-1", "old-2"))})
+    interrupted = InterruptingPruneRunner()
+    monkeypatch.setattr(cli, "PruneRunner", lambda: interrupted)
+
+    assert cli.main(["prune-notes", "--superseded", "--apply"]) == 130
+    assert "prune interrupted" in capsys.readouterr().err
+    assert interrupted.deleted_notes == ["old-1"], "exactly one delete was issued before Ctrl-C"
+    state = json.loads((tmp_path / ".quip2md" / "notes_state.json").read_text())
+    assert state["T1"]["note_id"] == "live-1"
+    assert state["T1"]["superseded_note_ids"] == ["old-2"], (
+        "old-1 is already gone from Notes; the flushed state must say so"
+    )
+
+    # `KeyboardInterrupt` must be caught, not propagated out of `cli.main`.
+    rerun = RecordingPruneRunner()
+    monkeypatch.setattr(cli, "PruneRunner", lambda: rerun)
+    assert cli.main(["prune-notes", "--superseded", "--apply"]) == 0
+    out = capsys.readouterr().out
+    assert "notes deleted:     1" in out
+    assert rerun.deleted_notes == ["old-2"], "the re-run must not re-delete old-1"
+    state = json.loads((tmp_path / ".quip2md" / "notes_state.json").read_text())
+    assert state["T1"].get("superseded_note_ids", []) == []
