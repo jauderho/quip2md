@@ -195,27 +195,34 @@ def _prune_superseded(
         if not entry.superseded_note_ids:
             continue
         kept: list[str] = []
+        # Ids whose outcome is not yet known. State is flushed after every id,
+        # so a Ctrl-C (a BaseException, which the per-note `except` does not
+        # catch) cannot leave a deleted id recorded as superseded. An id leaves
+        # `remaining` only once its outcome is known: an interrupt during the
+        # delete itself keeps the id, and the re-run tries it again.
+        remaining = list(entry.superseded_note_ids)
         for note_id in entry.superseded_note_ids:
-            if note_id in live:
-                # Paranoia, not decoration: deleting a note that is also some
-                # document's current copy would destroy live data.
-                report.skipped.append((note_id, "still the current note for a document"))
-                kept.append(note_id)
-                continue
-            if not apply:
-                report.notes_deleted += 1
-                continue
             try:
-                runner.delete_note(note_id)
-            except Exception as exc:  # broad by design: per-note failure isolation
-                report.failed.append((note_id, str(exc)))
-                kept.append(note_id)
-                continue
-            report.notes_deleted += 1
-        if apply:
-            state.record(key, _without_superseded(entry, kept))
-    if apply:
-        state.flush()
+                if note_id in live:
+                    # Paranoia, not decoration: deleting a note that is also some
+                    # document's current copy would destroy live data.
+                    report.skipped.append((note_id, "still the current note for a document"))
+                    kept.append(note_id)
+                elif not apply:
+                    report.notes_deleted += 1
+                else:
+                    try:
+                        runner.delete_note(note_id)
+                    except Exception as exc:  # broad by design: per-note failure isolation
+                        report.failed.append((note_id, str(exc)))
+                        kept.append(note_id)
+                    else:
+                        report.notes_deleted += 1
+                remaining.remove(note_id)
+            finally:
+                if apply:
+                    state.record(key, _without_superseded(entry, kept + remaining))
+                    state.flush()
 
 
 def _without_superseded(entry: NoteStateEntry, kept: Sequence[str]) -> NoteStateEntry:

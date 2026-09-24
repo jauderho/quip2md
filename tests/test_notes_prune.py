@@ -391,3 +391,117 @@ def test_the_lock_is_released_even_when_the_run_raises(tmp_path: Path) -> None:
         raise RuntimeError("boom")
     with notes_run_lock(tmp_path / ".quip2md"):
         pass
+
+
+# --- Ctrl-C during an apply: state is flushed so a re-run resumes ------------
+#
+# `except Exception` does not catch `KeyboardInterrupt`, so these pin per-id
+# persistence. The interrupt lands *instead of* a delete: Ctrl-C reaches the
+# whole foreground process group, so `osascript` is killed before Notes acts.
+# An id interrupted mid-delete therefore stays recorded, and the re-run retries it.
+
+
+@dataclass
+class InterruptingPruneRunner(FakePruneRunner):
+    """Deletes normally until call `interrupt_on`, which raises like a Ctrl-C."""
+
+    interrupt_on: int = 1
+    calls: int = 0
+
+    def delete_note(self, note_id: str) -> None:
+        self.calls += 1
+        if self.calls == self.interrupt_on:
+            raise KeyboardInterrupt
+        super().delete_note(note_id)
+
+
+def _interrupted_prune(tmp_path: Path, interrupt_on: int) -> InterruptingPruneRunner:
+    runner = InterruptingPruneRunner(interrupt_on=interrupt_on)
+    with pytest.raises(KeyboardInterrupt):
+        prune_notes(runner, _config(tmp_path), superseded=True, apply=True)
+    return runner
+
+
+def _superseded_on_disk(tmp_path: Path, key: str) -> list[str]:
+    state = json.loads((tmp_path / ".quip2md" / "notes_state.json").read_text())
+    return state[key].get("superseded_note_ids", [])
+
+
+def test_an_interrupt_keeps_the_interrupted_and_later_ids_in_order(tmp_path: Path) -> None:
+    """Deleted ids leave the state; the interrupted id and later ones stay, in order."""
+    _write_state(tmp_path, {"T1": _entry("live-1", superseded=["A", "B", "C", "D"])})
+    runner = _interrupted_prune(tmp_path, interrupt_on=3)
+
+    assert runner.deleted_notes == ["A", "B"]
+    assert _superseded_on_disk(tmp_path, "T1") == ["C", "D"]
+
+    rerun = FakePruneRunner()
+    report = prune_notes(rerun, _config(tmp_path), superseded=True, apply=True)
+    assert rerun.deleted_notes == ["C", "D"], "the re-run retries C and never re-deletes A or B"
+    assert report.notes_deleted == 2
+    assert _superseded_on_disk(tmp_path, "T1") == []
+
+
+def test_an_interrupt_before_any_delete_leaves_state_unchanged(tmp_path: Path) -> None:
+    """No delete finished, so no id may leave the state."""
+    _write_state(tmp_path, {"T1": _entry("live-1", superseded=["X", "Y"])})
+    runner = _interrupted_prune(tmp_path, interrupt_on=1)
+
+    assert runner.deleted_notes == []
+    assert _superseded_on_disk(tmp_path, "T1") == ["X", "Y"]
+
+
+def test_a_still_live_id_stays_recorded_when_a_later_delete_is_interrupted(
+    tmp_path: Path,
+) -> None:
+    """The live-id skip must survive an interrupt: it never costs a document its note."""
+    _write_state(
+        tmp_path,
+        {"T1": _entry("live-1", superseded=["live-1", "X", "Y"]), "T2": _entry("live-2")},
+    )
+    runner = _interrupted_prune(tmp_path, interrupt_on=2)
+
+    assert runner.deleted_notes == ["X"]
+    assert _superseded_on_disk(tmp_path, "T1") == ["live-1", "Y"]
+
+
+def test_an_interrupt_between_keys_persists_the_done_key_and_pending_ids(
+    tmp_path: Path,
+) -> None:
+    """A fully-done key stays done; an interrupted key keeps its unsettled ids."""
+    _write_state(
+        tmp_path,
+        {
+            "T1": _entry("live-1", superseded=["old-a"]),
+            "T2": _entry("live-2", superseded=["old-b", "old-c"]),
+        },
+    )
+    runner = _interrupted_prune(tmp_path, interrupt_on=2)  # Ctrl-C on old-b
+
+    assert runner.deleted_notes == ["old-a"]
+    assert _superseded_on_disk(tmp_path, "T1") == []
+    assert _superseded_on_disk(tmp_path, "T2") == ["old-b", "old-c"]
+
+
+def test_a_plan_touches_no_state(tmp_path: Path) -> None:
+    """A plan never flushes, so the state file stays byte-identical."""
+    state_path = _write_state(tmp_path, {"T1": _entry("live-1", superseded=["X", "Y", "Z"])})
+    before = state_path.read_bytes()
+    runner = InterruptingPruneRunner(interrupt_on=1)  # would raise on apply; never called
+
+    report = prune_notes(runner, _config(tmp_path), superseded=True, apply=False)
+
+    assert report.notes_deleted == 3
+    assert runner.calls == 0
+    assert state_path.read_bytes() == before
+
+
+def test_an_interrupt_during_an_apply_releases_the_run_lock(tmp_path: Path) -> None:
+    """A second run must be able to acquire the lock after an interrupted one."""
+    from quip2md.notes_import import notes_run_lock
+
+    _write_state(tmp_path, {"T1": _entry("live-1", superseded=["old-1", "old-2"])})
+    _interrupted_prune(tmp_path, interrupt_on=1)
+
+    with notes_run_lock(tmp_path / ".quip2md"):
+        pass  # the lock must have been released on the way out of the interrupted run
