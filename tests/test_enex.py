@@ -254,6 +254,19 @@ def test_commonmark_nesting_beats_the_python_markdown_shape() -> None:
     assert "</ul></li><li>sibling one</li><li>sibling two</li></ul>" in note.enml
 
 
+def test_a_loose_plain_item_emits_its_blocks_in_document_order() -> None:
+    """A sub-list between two paragraphs stays between them, not hoisted to the end.
+
+    The native path preserves the `<li>`'s block structure; before the fix it
+    accumulated all inline content into one list and all sub-lists into a
+    second one, then joined them as inline-then-sublists -- so a trailing
+    paragraph ended up *before* a sub-list that precedes it in the source.
+    """
+    note = _render("- first\n\n  - inner\n\n  outer\n")
+    assert "<li>first<ul><li>inner</li></ul>outer</li>" in note.enml
+    assert note.enml.index("first") < note.enml.index("<li>inner</li>") < note.enml.index("outer")
+
+
 # --- Headings, code, tables, quotes, rules ---------------------------------
 
 
