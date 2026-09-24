@@ -879,6 +879,121 @@ def test_the_editor_lines_are_re_read_after_an_undo() -> None:
     assert len(reads) >= 3
 
 
+@dataclass
+class StuckBeforeAbandonRunner(SimulatingIndentRunner):
+    """A Notes that permanently refuses some lines and corrupts one on a later step.
+
+    Models the import shape that exposes the undo-verification false positive: a
+    line Notes will never move (in `stuck_indices`) is set aside by `_ignoring`,
+    so the planner emits a *later* step whose `start` is past it; that later step
+    then diverges on read-back (`corrupt_active` prepends ``CORRUPT `` to the
+    text at `corrupt_at`), which is what drives the note into `_abandon` while
+    the stuck line still precedes `step.start`.
+    """
+
+    stuck_indices: set[int] = field(default_factory=set)
+    corrupt_start: int = -1
+    corrupt_at: int = -1
+    corrupt_active: bool = False
+
+    def _texts(self) -> list[str]:
+        t = list(self.texts)
+        if self.corrupt_active and 0 <= self.corrupt_at < len(t):
+            t[self.corrupt_at] = "CORRUPT " + t[self.corrupt_at]
+        return t
+
+    def apply_step(self, step: IndentStep, *, origin: int | None = None) -> None:
+        self.applied.append(step)
+        for index in range(step.start, step.start + step.count):
+            if index not in self.stuck_indices:
+                self.depths[index] += step.levels
+        if step.start == self.corrupt_start:
+            self.corrupt_active = True
+
+    def undo(self, *, outdent: bool) -> None:
+        self.undone += 1
+        self.corrupt_active = False  # undo restores the corrupted text
+        step = self.applied[-1]
+        for index in range(step.start, step.start + step.count):
+            if index not in self.stuck_indices:
+                self.depths[index] -= 1 if outdent else -1
+
+    def read_lines(self, note_id: str) -> list[str]:
+        return list(self._texts())
+
+    def read_body(self, note_id: str) -> str:
+        out = []
+        for text, depth in zip(self._texts(), self.depths, strict=True):
+            out.append("<ul>" * (depth + 1) + f"<li>{text}</li>" + "</ul>" * (depth + 1))
+        return "".join(out)
+
+
+def test_a_stuck_line_before_the_abandoning_step_is_not_a_failed_undo() -> None:
+    """A clean undo must not be reported as half-restored over a line it never touched.
+
+    The realistic mid-note shape: a line wanting depth 2 with only depth-0 lines
+    above it is clamped by Notes, so the first no-progress step parks it in
+    `stuck` and the planner skips it. The next step indents a *later* line, and
+    that step's read-back diverges, entering `_abandon`. The undo restores the
+    note exactly, but the old `verify_indentation(applied_through=step.start)`
+    compared the stuck line (still at its pre-step depth) against its *target*
+    depth, so it always failed and appended a spurious ``undo did not restore``
+    alongside the legitimate ``verification failed``.
+    """
+    items = _items(("top0", 0), ("top1", 0), ("stuck", 2), ("mover", 1))
+    runner = StuckBeforeAbandonRunner(
+        texts=["top0", "top1", "stuck", "mover"],
+        depths=[0, 0, 0, 0],
+        stuck_indices={2},
+        corrupt_start=3,
+        corrupt_at=0,
+    )
+    report = indent_notes(runner, [("id-1", "Doc", items)])
+
+    reasons = [reason for _, reason in report.failures]
+    assert runner.depths == [0, 0, 0, 0]  # undo genuinely restored the note
+    assert runner.undone == 1  # the failing step was actually walked back
+    assert any("verification failed" in reason for reason in reasons)  # the real failure
+    assert not any("undo did not restore" in reason for reason in reasons)  # the false alarm
+
+
+def test_undo_still_flags_a_genuinely_half_restored_note() -> None:
+    """The fix must not mask a real half-undo of a touched line.
+
+    `applied_through=0` checks every line against `baseline`, so a touched line
+    left at the wrong depth after undo is still caught -- the false positive is
+    removed without weakening the safety net. The step indents the last line
+    ("c") to depth 1 (its plan), the undo refuses to move it back, so the note
+    is *not* at its pre-step `baseline` and the undo is correctly reported as
+    unrestored. (This also pins the choice of `applied_through=0` over `None`:
+    `None` checks against *target*, and "c" is at its target, so it would
+    silently mask this half-undo.)
+    """
+    items = _items(("a", 0), ("b", 0), ("c", 1))
+
+    @dataclass
+    class HalfRestoringRunner(StuckBeforeAbandonRunner):
+        def undo(self, *, outdent: bool) -> None:
+            self.undone += 1
+            self.corrupt_active = False  # text is restored, but the depth is not
+            # Note: deliberately leave the touched line where the step put it.
+
+    runner = HalfRestoringRunner(
+        texts=["a", "b", "c"],
+        depths=[0, 0, 0],
+        stuck_indices=set(),
+        corrupt_start=2,
+        corrupt_at=0,
+    )
+    report = indent_notes(runner, [("id-1", "Doc", items)])
+
+    reasons = [reason for _, reason in report.failures]
+    # The step on item index 2 ("c") raised it to depth 1; the undo left it there.
+    assert runner.depths[2] == 1
+    assert any("verification failed" in reason for reason in reasons)
+    assert any("undo did not restore" in reason for reason in reasons)
+
+
 # --- Adversarial review: failure paths of the real runner -------------------
 
 

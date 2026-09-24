@@ -470,9 +470,14 @@ def _undo_step(
     # Re-locate rather than reuse `paragraphs`: the step being undone may have
     # shifted the lines, which is what put us here.
     settled = locate_checklist_paragraphs(restored, items) or paragraphs
+    # An undo must return *every* line to its pre-step depth (`baseline`), not
+    # "lines before `start` at target, the rest at baseline." A stuck line
+    # before `start` is still at its pre-step depth, so comparing it to its
+    # target (`item.depth`) would flag a clean undo. `applied_through=0`
+    # routes all positions through the `baseline` branch; `None` would instead
+    # check all positions against the target. See `_ignoring` for stuck lines.
     return (
-        verify_indentation(restored, items, settled, applied_through=step.start, baseline=baseline)
-        is None
+        verify_indentation(restored, items, settled, applied_through=0, baseline=baseline) is None
     )
 
 
