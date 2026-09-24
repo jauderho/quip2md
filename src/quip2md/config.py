@@ -27,7 +27,6 @@ class Config:
     output_dir: Path
     state_path: Path
     dry_run: bool
-    verbose: bool
     include_chats: bool
     force: bool
     base_url: str = DEFAULT_BASE_URL
@@ -39,7 +38,6 @@ def load_config(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     state_path: Path = DEFAULT_STATE_PATH,
     dry_run: bool = False,
-    verbose: bool = False,
     include_chats: bool = False,
     force: bool = False,
 ) -> Config:
@@ -72,7 +70,6 @@ def load_config(
         output_dir=output_dir,
         state_path=state_path,
         dry_run=dry_run,
-        verbose=verbose,
         include_chats=include_chats,
         force=force,
     )
