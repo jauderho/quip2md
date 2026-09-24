@@ -59,7 +59,6 @@ def make_config() -> Config:
         output_dir=Path("export"),
         state_path=Path(".quip2md/state.json"),
         dry_run=False,
-        verbose=False,
         include_chats=False,
         force=False,
     )
