@@ -46,12 +46,6 @@ RETRY_MAX_DELAY_SECONDS = 120.0
 MAX_ATTEMPTS_429_503 = 6
 MAX_ATTEMPTS_OTHER_5XX = 3
 
-# Upper bound on v2 thread-html pages, so a server returning an unbounded
-# stream of ever-changing cursors cannot stall one thread indefinitely.
-# Real documents paginate in a handful of pages; 1000 is far above any
-# legitimate case.
-MAX_HTML_PAGES = 1000
-
 LOW_REMAINING_THRESHOLD = 5
 _REMAINING_HEADER_NAMES = ("x-ratelimit-remaining", "x-company-ratelimit-remaining")
 _RESET_HEADER_NAMES = ("x-ratelimit-reset", "x-company-ratelimit-reset")
@@ -81,10 +75,6 @@ class QuipApiError(Exception):
         self.path = path
         display_message = message if message is not None else "<no error message>"
         super().__init__(f"Quip API error {status_code} on {path}: {display_message}")
-
-
-class _ThreadHtmlV2Unavailable(Exception):
-    """Internal signal that the v2 thread-html endpoint is not usable here."""
 
 
 # --- Models ------------------------------------------------------------
@@ -126,15 +116,6 @@ class QuipFolder:
     id: str
     title: str
     children: tuple[FolderChild, ...]
-
-
-@dataclass(slots=True, frozen=True)
-class QuipThread:
-    id: str
-    title: str
-    thread_type: ThreadType
-    updated_usec: int | None
-    link: str | None
 
 
 @dataclass(slots=True, frozen=True)
@@ -273,28 +254,10 @@ def _parse_thread_type(value: object) -> ThreadType:
     return ThreadType.OTHER
 
 
-def _parse_thread(payload: dict[str, object], path: str) -> QuipThread:
-    thread_data = _as_object_dict(payload.get("thread")) or payload
-    thread_id = _require_str(thread_data.get("id"), "id", path)
-    title = _str_or_none(thread_data.get("title")) or ""
-    thread_type = _parse_thread_type(thread_data.get("type"))
-    updated_raw = thread_data.get("updated_usec")
-    updated_usec = updated_raw if isinstance(updated_raw, int) else None
-    link = _str_or_none(thread_data.get("link")) or _str_or_none(thread_data.get("url"))
-    return QuipThread(
-        id=thread_id,
-        title=title,
-        thread_type=thread_type,
-        updated_usec=updated_usec,
-        link=link,
-    )
-
-
 def _parse_thread_content(thread_id: str, entry: dict[str, object]) -> ThreadContent:
     """Parse one entry of the `/1/threads/?ids=` batch response.
 
-    Unlike `_parse_thread` (used for the v2 single-thread metadata shape),
-    the id here is taken from the response dict's own key rather than
+    The id here is taken from the response dict's own key rather than
     required inside `thread_data`, and tolerant of a missing/malformed
     nested `thread` object: this is a bulk endpoint where one odd entry
     should not fail the whole batch.
@@ -319,15 +282,6 @@ def _parse_thread_content(thread_id: str, entry: dict[str, object]) -> ThreadCon
         link=link,
         html=html,
     )
-
-
-def _extract_next_cursor(payload: dict[str, object]) -> str:
-    metadata = _as_object_dict(payload.get("response_metadata"))
-    if metadata is not None:
-        cursor = metadata.get("next_cursor")
-        if isinstance(cursor, str):
-            return cursor
-    return ""
 
 
 def _default_jitter(capped_delay: float) -> float:
@@ -437,7 +391,6 @@ class QuipClient:
         self._sleep = sleep
         self._jitter_fn = jitter_fn
         self._limiter = RateLimiter(clock=clock, sleep=sleep)
-        self._html_api_version: str | None = None
         timeout = httpx.Timeout(
             connect=CONNECT_TIMEOUT_SECONDS,
             read=READ_TIMEOUT_SECONDS,
@@ -594,76 +547,6 @@ class QuipClient:
                 result[thread_id] = _parse_thread_content(thread_id, entry_dict)
         return result
 
-    def thread(self, thread_id: str) -> QuipThread:
-        path = f"/2/threads/{thread_id}"
-        response = self._request("GET", path)
-        return _parse_thread(_json_object(response, path), path)
-
-    def _thread_html_v2(self, thread_id: str) -> str:
-        path = f"/2/threads/{thread_id}/html"
-        parts: list[str] = []
-        seen_cursors: set[str] = set()
-        cursor: str | None = None
-        while True:
-            params = {"cursor": cursor} if cursor else None
-            try:
-                response = self._request("GET", path, params=params)
-            except QuipApiError as exc:
-                if exc.status_code in (404, 403, 410):
-                    raise _ThreadHtmlV2Unavailable from exc
-                raise
-            payload = _json_object(response, path)
-            html_piece = payload.get("html")
-            if isinstance(html_piece, str):
-                parts.append(html_piece)
-            next_cursor = _extract_next_cursor(payload)
-            if not next_cursor:
-                break
-            if next_cursor in seen_cursors:
-                raise QuipApiError(
-                    status_code=response.status_code,
-                    message="Repeated pagination cursor from thread-html endpoint",
-                    path=path,
-                )
-            if len(seen_cursors) >= MAX_HTML_PAGES:
-                raise QuipApiError(
-                    status_code=response.status_code,
-                    message=f"thread-html pagination exceeded {MAX_HTML_PAGES} pages",
-                    path=path,
-                )
-            seen_cursors.add(next_cursor)
-            cursor = next_cursor
-        return "".join(parts)
-
-    def _thread_html_v1(self, thread_id: str) -> str:
-        path = "/1/threads/"
-        response = self._request("GET", path, params={"ids": thread_id})
-        payload = _json_object(response, path)
-        entry = _as_object_dict(payload.get(thread_id))
-        if entry is None:
-            entry = next(
-                (candidate for value in payload.values() if (candidate := _as_object_dict(value))),
-                {},
-            )
-        html_value = entry.get("html")
-        return html_value if isinstance(html_value, str) else ""
-
-    def thread_html(self, thread_id: str) -> str:
-        """Fetch full thread HTML, trying v2 (paginated) then falling back to v1.
-
-        Which API version worked is cached on the instance so the v2
-        probe only happens once per client instance, not once per thread.
-        """
-        if self._html_api_version != "v1":
-            try:
-                html = self._thread_html_v2(thread_id)
-            except _ThreadHtmlV2Unavailable:
-                self._html_api_version = "v1"
-            else:
-                self._html_api_version = "v2"
-                return html
-        return self._thread_html_v1(thread_id)
-
     def blob(self, thread_id: str, blob_id: str) -> tuple[bytes, str | None]:
         path = f"/1/blob/{thread_id}/{blob_id}"
         response = self._request("GET", path)
@@ -671,10 +554,5 @@ class QuipClient:
 
     def export_xlsx(self, thread_id: str) -> bytes:
         path = f"/1/threads/{thread_id}/export/xlsx"
-        response = self._request("GET", path)
-        return response.content
-
-    def export_pdf(self, thread_id: str) -> bytes:
-        path = f"/1/threads/{thread_id}/export/pdf"
         response = self._request("GET", path)
         return response.content
