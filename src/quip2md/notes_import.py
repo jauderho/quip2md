@@ -969,7 +969,7 @@ class ImportReport:
 
 
 def run_import(
-    runner: NotesRunnerProtocol,
+    runner: NotesRunnerProtocol | None,
     config: Config,
     *,
     source_dir: Path = DEFAULT_OUTPUT_DIR,
@@ -997,7 +997,9 @@ def run_import(
     `runner` is accepted even in dry-run mode for interface symmetry with
     a real run (mirroring `walker.walk()`'s treatment of `config`) --
     callers may pass any `NotesRunnerProtocol`-satisfying value, including
-    a real `NotesRunner`, since it is guaranteed never to be called.
+    a real `NotesRunner`, since it is guaranteed never to be called. `runner`
+    may be `None`, which a dry run passes (and a real run never does) -- a
+    real run with `None` raises `NotesError`, matching `run_enex_import()`.
     """
     start_time = time.monotonic()
     only_keys = frozenset(only) if only is not None else None
@@ -1021,6 +1023,9 @@ def run_import(
         _dry_run_diff(sources, state, report)
         report.elapsed_seconds = time.monotonic() - start_time
         return report
+
+    if runner is None:
+        raise NotesError("a Notes runner is required for a real (non-dry-run) import")
 
     # Everything past here writes to Notes and to the state file, so it runs
     # under the same lock the `.enex` path takes: two concurrent runs would
