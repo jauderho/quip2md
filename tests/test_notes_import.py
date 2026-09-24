@@ -745,6 +745,32 @@ def test_dry_run_reports_per_folder_counts(tmp_path: Path) -> None:
     assert report.folder_counts == {"Quip/A": 2, "Quip/B": 1}
 
 
+def test_dry_run_accepts_none_runner(tmp_path: Path) -> None:
+    # The CLI now passes `None` for `runner` on a dry run (so it never
+    # constructs `NotesRunner` and never trips its non-macOS guard).
+    # `run_import` must accept that and still return a report, since a
+    # dry run calls `runner` zero times.
+    source_dir = tmp_path / "export"
+    write_note_md(source_dir, "one.md", quip_id="t1", title="One", body="Hello world")
+    config = make_config(tmp_path, dry_run=True)
+
+    report = run_import(None, config, source_dir=source_dir)
+
+    assert report.created == 1
+    assert not (config.state_path.parent / "notes_state.json").exists()
+
+
+def test_real_run_with_none_runner_raises_notes_error(tmp_path: Path) -> None:
+    # Mirrors `run_enex_import`'s guard: a real (non-dry-run) import with
+    # no runner is a programming error, not a silent no-op.
+    source_dir = tmp_path / "export"
+    write_note_md(source_dir, "one.md", quip_id="t1", title="One", body="Hello world")
+    config = make_config(tmp_path, dry_run=False)
+
+    with pytest.raises(NotesError, match="a Notes runner is required for a real"):
+        run_import(None, config, source_dir=source_dir)
+
+
 # --- run_import: failure isolation ---------------------------------------
 
 
