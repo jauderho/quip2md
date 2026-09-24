@@ -59,6 +59,12 @@ Total distinct thread IDs discovered as folder children so far: 411
   - v1 entry keys: `['access_levels', 'expanded_user_ids', 'html', 'invited_user_emails', 'shared_folder_ids', 'thread', 'user_ids']`; `thread.html` present: False
 Enrichment: fetched 25 additional thread(s) via batched `GET /1/threads/?ids=` to widen the fixture/image/spreadsheet sample.
 
+v1 does not truncate. The export uses only `GET /1/threads/?ids=`. A later
+check compared it with the paginated v2 endpoint for the five largest
+documents in the account (up to 156 KB of HTML). v2 returned one page for
+each, and the visible text was identical; only markup differed. The unused
+paginated v2 client code was then removed.
+
 ---
 
 ## 4. Blob download

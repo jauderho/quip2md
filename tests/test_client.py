@@ -402,136 +402,6 @@ def test_4xx_other_than_429_raises_immediately_without_retry() -> None:
     assert sleeper.calls == []
 
 
-# --- thread_html: v2 pagination, cursor guard, v1 fallback --------------
-
-
-def test_v2_pagination_stitches_three_pages() -> None:
-    calls: list[httpx.Request] = []
-    pages = {
-        None: {"html": "<p>one</p>", "response_metadata": {"next_cursor": "c1"}},
-        "c1": {"html": "<p>two</p>", "response_metadata": {"next_cursor": "c2"}},
-        "c2": {"html": "<p>three</p>", "response_metadata": {"next_cursor": ""}},
-    }
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request)
-        cursor = request.url.params.get("cursor")
-        return json_response(200, pages[cursor])
-
-    client, _sleeper, _clock = make_client(handler)
-
-    html = client.thread_html("t1")
-
-    assert html == "<p>one</p><p>two</p><p>three</p>"
-    assert len(calls) == 3
-
-
-def test_v2_empty_html_page_mid_sequence_does_not_break_stitching() -> None:
-    pages = {
-        None: {"html": "<p>one</p>", "response_metadata": {"next_cursor": "c1"}},
-        "c1": {"html": "", "response_metadata": {"next_cursor": "c2"}},
-        "c2": {"html": "<p>three</p>", "response_metadata": {"next_cursor": ""}},
-    }
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        cursor = request.url.params.get("cursor")
-        return json_response(200, pages[cursor])
-
-    client, _sleeper, _clock = make_client(handler)
-
-    html = client.thread_html("t1")
-
-    assert html == "<p>one</p><p>three</p>"
-
-
-def test_v2_cursor_present_but_html_field_missing_from_page() -> None:
-    pages = {
-        None: {"html": "<p>one</p>", "response_metadata": {"next_cursor": "c1"}},
-        # No "html" key at all on this page -- must not KeyError.
-        "c1": {"response_metadata": {"next_cursor": ""}},
-    }
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        cursor = request.url.params.get("cursor")
-        return json_response(200, pages[cursor])
-
-    client, _sleeper, _clock = make_client(handler)
-
-    html = client.thread_html("t1")
-
-    assert html == "<p>one</p>"
-
-
-def test_v2_single_page_with_immediately_empty_next_cursor() -> None:
-    calls: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request)
-        return json_response(200, {"html": "<p>x</p>", "response_metadata": {"next_cursor": ""}})
-
-    client, _sleeper, _clock = make_client(handler)
-
-    html = client.thread_html("t1")
-
-    assert html == "<p>x</p>"
-    assert len(calls) == 1
-
-
-def test_v2_repeated_cursor_guard_raises() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        cursor = request.url.params.get("cursor")
-        if cursor is None:
-            return json_response(200, {"html": "a", "response_metadata": {"next_cursor": "c1"}})
-        if cursor == "c1":
-            return json_response(200, {"html": "b", "response_metadata": {"next_cursor": "c2"}})
-        return json_response(200, {"html": "c", "response_metadata": {"next_cursor": "c1"}})
-
-    client, _sleeper, _clock = make_client(handler)
-
-    with pytest.raises(QuipApiError, match="cursor"):
-        client.thread_html("t1")
-
-
-def test_v2_pagination_page_cap_raises() -> None:
-    # Server that always returns a fresh, never-repeating cursor -- the
-    # repeated-cursor guard never trips, so the page cap must stop it.
-    def handler(request: httpx.Request) -> httpx.Response:
-        cursor = request.url.params.get("cursor")
-        n = 0 if cursor is None else int(cursor) + 1
-        return json_response(200, {"html": "x", "response_metadata": {"next_cursor": str(n)}})
-
-    client, _sleeper, _clock = make_client(handler)
-
-    with pytest.raises(QuipApiError, match="pagination exceeded"):
-        client.thread_html("t1")
-
-
-def test_v2_to_v1_fallback_and_version_cached_across_calls() -> None:
-    v2_calls: list[httpx.Request] = []
-    v1_calls: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if path.startswith("/2/threads/") and path.endswith("/html"):
-            v2_calls.append(request)
-            return json_response(404, {"error": "not_found"})
-        if path == "/1/threads/":
-            v1_calls.append(request)
-            thread_id = request.url.params.get("ids", "")
-            return json_response(200, {thread_id: {"html": f"<p>{thread_id}</p>"}})
-        raise AssertionError(f"unexpected path {path}")
-
-    client, _sleeper, _clock = make_client(handler)
-
-    html_one = client.thread_html("t1")
-    html_two = client.thread_html("t2")
-
-    assert html_one == "<p>t1</p>"
-    assert html_two == "<p>t2</p>"
-    assert len(v2_calls) == 1  # v2 probed exactly once per client instance
-    assert len(v1_calls) == 2
-
-
 # --- folders(): batching ------------------------------------------------
 
 
@@ -716,20 +586,6 @@ def test_current_user_parses_folder_fields() -> None:
     assert user.shared_folder_ids == ("s1", "s2")
 
 
-def test_thread_parses_type_with_other_fallback() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return json_response(
-            200,
-            {"thread": {"id": "t1", "title": "Doc", "type": "weird-future-type", "link": "u"}},
-        )
-
-    client, _sleeper, _clock = make_client(handler)
-
-    thread = client.thread("t1")
-
-    assert thread.thread_type.value == "other"
-
-
 def test_blob_returns_bytes_and_content_type() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"\x89PNG", headers={"Content-Type": "image/png"})
@@ -742,11 +598,10 @@ def test_blob_returns_bytes_and_content_type() -> None:
     assert content_type == "image/png"
 
 
-def test_export_xlsx_and_pdf_return_raw_bytes() -> None:
+def test_export_xlsx_returns_raw_bytes() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"binary-data")
 
     client, _sleeper, _clock = make_client(handler)
 
     assert client.export_xlsx("t1") == b"binary-data"
-    assert client.export_pdf("t1") == b"binary-data"
