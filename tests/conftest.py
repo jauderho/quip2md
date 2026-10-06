@@ -66,3 +66,16 @@ def _block_real_notes_automation(monkeypatch: pytest.MonkeyPatch) -> None:
 
     for name in _GUARDED_SUBPROCESS_CALLS:
         monkeypatch.setattr(subprocess, name, guard(name, getattr(subprocess, name)))
+
+
+@pytest.fixture(autouse=True)
+def _host_notes_cannot_import_markdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the CLI's default writer independent of the machine running the tests.
+
+    `import-notes` defaults to the Markdown route when the installed Notes can
+    import Markdown. Without this, the same test would exercise a different
+    writer on a newer Mac. Tests of the Markdown route opt in explicitly.
+    """
+    from quip2md import cli
+
+    monkeypatch.setattr(cli, "markdown_import_available", lambda: False, raising=False)

@@ -3,7 +3,7 @@
 Usage:
     quip2md export [--output DIR] [--dryrun] [--verbose | -v] [--force]
                     [--include-chats] [--only THREAD_ID [--only THREAD_ID ...]]
-    quip2md import-notes [--source DIR] [--writer enex|applescript]
+    quip2md import-notes [--source DIR] [--writer markdown|enex|applescript]
                     [--enex-file FILE] [--indent-checklists] [--local]
                     [--dryrun] [--verbose | -v] [--force] [--workers N]
                     [--only KEY [--only KEY ...]]
@@ -33,12 +33,19 @@ Switches (all under the `import-notes` subcommand):
     --source DIR         Directory containing the Markdown tree an earlier
                          `quip2md export` run wrote (frontmatter + body).
                          Defaults to ./export.
-    --writer WRITER       `enex` (default) renders one Evernote archive and
-                         hands it to Notes' own importer, which preserves
-                         hyperlinks and native checklists; it needs one
-                         click on Notes' confirmation sheet. `applescript`
-                         is the legacy body writer, which cannot produce
-                         either (see docs/NOTES_API_NOTES.md).
+    --writer WRITER       `markdown` (the default where Notes can import
+                         Markdown, Notes 4.13 / macOS 27 and later) imports
+                         every document without an image through Notes'
+                         Markdown importer: checklists arrive natively
+                         nested, and each note keeps its Quip creation and
+                         modification dates. Documents with images still go
+                         through an Evernote archive, which embeds them. Up
+                         to two clicks on Notes' confirmation sheet.
+                         `enex` (the default elsewhere) imports everything
+                         through one Evernote archive, which preserves
+                         hyperlinks and checklists but flattens nested ones.
+                         `applescript` is the legacy body writer, which
+                         cannot produce either (see docs/NOTES_API_NOTES.md).
     --enex-file FILE      Where the `enex` writer puts its archive.
                          Defaults to .quip2md/quip2md.enex.
     --indent-checklists   After a successful `enex` import, drive the Notes
@@ -137,6 +144,7 @@ _DEFERRED_SYMBOLS = {
     "run_export": "quip2md.export",
     "EnexNotesRunner": "quip2md.notes_enex",
     "run_enex_import": "quip2md.notes_enex",
+    "markdown_import_available": "quip2md.notes_enex",
     "NotesError": "quip2md.notes_import",
     "NotesRunner": "quip2md.notes_import",
     "NotesStateError": "quip2md.notes_import",
@@ -274,12 +282,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     notes_parser.add_argument(
         "--writer",
-        choices=("enex", "applescript"),
-        default="enex",
+        choices=("markdown", "enex", "applescript"),
+        default=None,
         help=(
-            "enex (default): import via an Evernote archive, preserving links "
-            "and native checklists. applescript: the legacy body writer, which "
-            "cannot produce either."
+            "markdown (default where Notes supports it): Markdown import keeps "
+            "nested checklists and Quip's dates; documents with images use an "
+            "Evernote archive. enex (default elsewhere): one Evernote archive "
+            "for everything. applescript: the legacy body writer."
         ),
     )
     notes_parser.add_argument(
@@ -485,7 +494,7 @@ def _main_import_notes(args: argparse.Namespace) -> int:
         force=args.force,
     )
 
-    if args.writer == "enex":
+    if args.writer in ("markdown", "enex"):
         return _main_import_notes_enex(args, config)
 
     runner: NotesRunnerProtocol | None = None
@@ -542,6 +551,7 @@ def _main_import_notes_enex(args: argparse.Namespace, config: Config) -> int:
             only=args.only,
             workers=args.workers,
             adopt_landing=args.adopt_landing,
+            markdown=args.writer == "markdown",
         )
     except KeyboardInterrupt:
         print(
@@ -592,9 +602,11 @@ def _print_enex_report(report: EnexImportReport, *, dry_run: bool) -> None:
     heading = "Dry run (no Notes changes)." if dry_run else "Import complete."
     print(heading)
     print(f"  documents:           {report.documents}")
+    if report.markdown_path:
+        print(f"  markdown:            {report.markdown_path} ({report.markdown_notes} notes)")
     if report.enex_path:
         print(f"  archive:             {report.enex_path} ({report.enex_bytes / 1_000_000:.1f} MB)")
-    else:
+    elif not report.markdown_path:
         print("  archive:             none written (nothing to import)")
     print(
         f"  checklist items:     {report.checklist_items} "
@@ -651,10 +663,17 @@ def _reject_incompatible_writer_flags(
     silent success: `--local` cannot steer Notes' own importer, and the
     indentation pass only exists to repair what that importer flattens.
     """
-    if args.writer == "enex" and args.local:
+    if args.writer is None:
+        args.writer = "markdown" if _cli.markdown_import_available() else "enex"
+    elif args.writer == "markdown" and not _cli.markdown_import_available():
         parser.error(
-            "--local cannot be used with --writer enex: Notes always imports an "
-            "archive into the default account. Use --writer applescript to "
+            "--writer markdown needs Notes 4.13 (macOS 27) or later, which can "
+            "import Markdown. Use --writer enex."
+        )
+    if args.writer in ("markdown", "enex") and args.local:
+        parser.error(
+            f"--local cannot be used with --writer {args.writer}: Notes always "
+            "imports into the default account. Use --writer applescript to "
             'target "On My Mac".'
         )
     if args.writer == "applescript" and args.indent_checklists:

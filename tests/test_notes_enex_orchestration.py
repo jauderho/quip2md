@@ -107,6 +107,9 @@ class FakeEnexRunner:
     def move_note(self, note_id: str, folder_id: str) -> None:
         self.moved.append((note_id, folder_id))
 
+    def child_folder_id(self, parent_id: str, name: str) -> str:
+        return f"{parent_id}/{name}"
+
     def open_enex(self, path: Path) -> None:
         self.opened.append(path)
         self._opened_yet = True
@@ -1318,7 +1321,7 @@ def test_a_failed_open_is_reported_rather_than_leaving_the_run_waiting(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _stub_subprocess(monkeypatch, returncode=1, stderr="Unable to find application")
-    with pytest.raises(NotesError, match="could not hand the .enex file to Notes"):
+    with pytest.raises(NotesError, match="could not hand quip2md.enex to Notes"):
         EnexNotesRunner().open_enex(tmp_path / "quip2md.enex")
 
 

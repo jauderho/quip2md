@@ -43,13 +43,16 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import os
+import plistlib
 import re
+import shutil
 import subprocess
 import sys
 import time
 from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -67,6 +70,7 @@ from quip2md.notes_import import (
     notes_run_lock,
     scan_source,
 )
+from quip2md.walker import sanitize_component
 
 logger = logging.getLogger("quip2md.notes_enex")
 
@@ -77,6 +81,26 @@ DEFAULT_ENEX_FILENAME = "quip2md.enex"
 
 #: Notes names its landing folders "Imported Notes", "Imported Notes 1", ...
 LANDING_FOLDER_PREFIX = "Imported Notes"
+
+#: Prefix of the staging folder the Markdown route writes. A folder import
+#: lands as `Imported Notes...` > the folder's name > the notes. Unlike an
+#: archive, it does *not* get a fresh landing folder -- Notes nests it in an
+#: existing "Imported Notes" when there is one -- so each run's folder carries a
+#: timestamp, and that unique name is how the run finds its notes.
+MARKDOWN_STAGING_DIRNAME = "quip2md-markdown"
+
+#: Notes 4.13 (macOS 27) added Markdown import: native nested checklists, and
+#: creation/modification dates taken from the file's birth time and mtime.
+_MARKDOWN_IMPORT_MIN_VERSION = (4, 13)
+_NOTES_INFO_PLIST = Path("/System/Applications/Notes.app/Contents/Info.plist")
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(")
+_MARKDOWN_TABLE_URL_RE = re.compile(r"(?m)^\|.*https?://.*\|\s*$")
+_MARKDOWN_SPECIAL_RE = re.compile(r"([\\`*_\[\]<>#|!~])")
+_MARKDOWN_ESCAPE_RE = re.compile(r"\\(.)")
+#: A checklist marker with nothing after it, its text on the next, deeper line.
+_EMPTY_TASK_MARKER_RE = re.compile(
+    r"(?m)^([ \t]*[-*+] \[[ xX]\])[ \t]*\n[ \t]+(?![-*+] |\d+\. )(?=\S)"
+)
 
 #: How long to wait for the user to click "Import" and for Notes to finish.
 IMPORT_POLL_INTERVAL_SECONDS = 3.0
@@ -145,6 +169,8 @@ class EnexImportReport:
     documents: int = 0
     enex_path: str = ""
     enex_bytes: int = 0
+    markdown_path: str = ""
+    markdown_notes: int = 0
     checklist_items: int = 0
     checklist_checked: int = 0
     links: int = 0
@@ -199,6 +225,8 @@ class EnexImportReport:
             "documents": self.documents,
             "enex_path": self.enex_path,
             "enex_bytes": self.enex_bytes,
+            "markdown_path": self.markdown_path,
+            "markdown_notes": self.markdown_notes,
             "checklist_items": self.checklist_items,
             "checklist_checked": self.checklist_checked,
             "links": self.links,
@@ -232,6 +260,8 @@ class EnexNotesRunnerProtocol(Protocol):
     def folder_id_by_name(self, account: str, name: str) -> str: ...
 
     def notes_in_folder(self, folder_id: str) -> list[ImportedNote]: ...
+
+    def child_folder_id(self, parent_id: str, name: str) -> str: ...
 
     def move_note(self, note_id: str, folder_id: str) -> None: ...
 
@@ -301,6 +331,19 @@ end run
 """
     + _AS_IS_TOP_LEVEL
 )
+
+_AS_CHILD_FOLDER_ID = """
+on run argv
+    set parentId to item 1 of argv
+    set wanted to item 2 of argv
+    tell application "Notes"
+        repeat with f in folders of folder id parentId
+            if name of f is wanted then return id of f
+        end repeat
+        return ""
+    end tell
+end run
+"""
 
 # Ids are snapshotted before any read so the collection is never mutated while
 # it is being walked (Notes errors out if it is).
@@ -439,6 +482,9 @@ class EnexNotesRunner:
     def folder_id_by_name(self, account: str, name: str) -> str:
         return self._run(_AS_FOLDER_ID_BY_NAME, [account, name]).strip()
 
+    def child_folder_id(self, parent_id: str, name: str) -> str:
+        return self._run(_AS_CHILD_FOLDER_ID, [parent_id, name]).strip()
+
     def get_or_create_folder(self, account: str, path: Sequence[str]) -> str:
         parent_id = ""
         for depth, name in enumerate(path):
@@ -494,11 +540,109 @@ class EnexNotesRunner:
         self._run(_AS_MOVE_NOTE, [note_id, folder_id])
 
     def open_enex(self, path: Path) -> None:
+        """Hand a `.enex` file, or a folder of Markdown files, to Notes' importer."""
         proc = subprocess.run(
             ["open", "-a", "Notes", str(path)], capture_output=True, text=True, check=False
         )
         if proc.returncode != 0:
-            raise NotesError("could not hand the .enex file to Notes", stderr=proc.stderr.strip())
+            raise NotesError(f"could not hand {path.name} to Notes", stderr=proc.stderr.strip())
+
+
+# --- Markdown route ------------------------------------------------------
+
+
+def markdown_import_available() -> bool:
+    """True when this Mac's Notes can import Markdown (Notes 4.13 and later)."""
+    try:
+        with _NOTES_INFO_PLIST.open("rb") as handle:
+            version = str(plistlib.load(handle).get("CFBundleShortVersionString", ""))
+    except OSError, plistlib.InvalidFileException:
+        return False
+    numbers = tuple(int(part) for part in re.findall(r"\d+", version)[:2])
+    return numbers >= _MARKDOWN_IMPORT_MIN_VERSION
+
+
+def routes_through_markdown(source: NoteSource) -> bool:
+    """Whether the Markdown route can carry this document.
+
+    Notes' Markdown importer never embeds an image: relative and absolute
+    paths, `file://` and `data:` URIs all arrive as plain links (tested on
+    Notes 4.13). A URL inside a table row is worse: the cell arrives empty and
+    every cell after it is lost (seen in a real document). Either keeps the
+    document on the archive route.
+    """
+    body = source.body_markdown
+    return not (_MARKDOWN_IMAGE_RE.search(body) or _MARKDOWN_TABLE_URL_RE.search(body))
+
+
+def markdown_note_text(source: NoteSource) -> str:
+    """The Markdown file for one note: title, provenance line, then the body.
+
+    The layout matches the archive route's note, so both routes produce the
+    same first lines and `_extract_quip_url` matches either. Notes takes the
+    note's title from the leading heading, and links the bare URL itself.
+    """
+    title = source.title.strip() or "Untitled"
+    body = _drop_leading_title_heading(source.body_markdown, title).strip()
+    # Notes reads an empty marker line as a bullet showing a literal "[ ]", so
+    # the item's first line of text is pulled up onto the marker.
+    body = _EMPTY_TASK_MARKER_RE.sub(r"\1 ", body)
+    lines = [f"# {_MARKDOWN_SPECIAL_RE.sub(r'\\\1', title)}", ""]
+    if source.quip_url:
+        lines += [f"{_PROVENANCE_PREFIX} {source.quip_url}", ""]
+    return "\n".join(lines) + "\n" + body + "\n"
+
+
+def _drop_leading_title_heading(markdown: str, title: str) -> str:
+    """Remove a first `# heading` that only repeats the title, as `enex.py` does."""
+    head, _, rest = markdown.lstrip("\n").partition("\n")
+    if head.startswith("# ") and _MARKDOWN_ESCAPE_RE.sub(r"\1", head[2:]).strip() == title:
+        return rest
+    return markdown
+
+
+def _write_markdown_folder(folder: Path, sources: Sequence[NoteSource]) -> None:
+    """Write one dated Markdown file per source into a fresh `folder`."""
+    if folder.exists():
+        shutil.rmtree(folder)
+    folder.mkdir(parents=True)
+    used: set[str] = set()
+    for source in sources:
+        stem = sanitize_component(source.title.strip() or "Untitled")
+        name, counter = stem, 2
+        while name.casefold() in used:
+            name, counter = f"{stem} ({counter})", counter + 1
+        used.add(name.casefold())
+        path = folder / f"{name}.md"
+        path.write_text(markdown_note_text(source), encoding="utf-8")
+        _set_file_dates(path, created=source.created, updated=source.updated)
+
+
+def _set_file_dates(path: Path, *, created: str | None, updated: str | None) -> None:
+    """Give `path` the document's dates; Notes reads them on import.
+
+    Notes takes a note's creation date from the file's birth time and its
+    modification date from the mtime. There is no call that sets a birth time,
+    but lowering the mtime below it lowers the birth time too (APFS), so the
+    file is stamped with the earlier date first and then the modification date.
+    """
+    stamps = [stamp for stamp in (_epoch(created), _epoch(updated)) if stamp is not None]
+    if not stamps:
+        return
+    born = stamps[0]
+    modified = stamps[-1]
+    earliest = min(born, modified)
+    os.utime(path, (earliest, earliest))
+    os.utime(path, (modified, modified))
+
+
+def _epoch(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
 # --- Rendering ----------------------------------------------------------
@@ -618,8 +762,15 @@ def run_enex_import(
     timeout_seconds: float = IMPORT_TIMEOUT_SECONDS,
     workers: int | None = None,
     adopt_landing: str | None = None,
+    markdown: bool = False,
 ) -> EnexImportReport:
     """Render `source_dir` to a single `.enex` and import it into Notes.
+
+    With `markdown`, every document without an image is imported through
+    Notes' Markdown importer instead (see `routes_through_markdown`): its
+    checklists arrive natively nested and both of its dates come from the
+    staged file, so no indentation pass is needed for it. The rest still goes
+    through the archive. Each route is one import, so up to two confirmations.
 
     In `config.dry_run` the `.enex` is still written (it is the artefact worth
     inspecting) but Notes is never contacted and no state is written -- so
@@ -660,7 +811,7 @@ def run_enex_import(
     state = NotesState(config.state_path.parent / NOTES_STATE_FILENAME)
     state.load()
 
-    pending = _select_pending(rendered, state, report, force=config.force)
+    pending = _select_pending(rendered, state, report, force=config.force, markdown=markdown)
     report.documents = len(pending)
     if not pending:
         logger.info(
@@ -670,8 +821,19 @@ def run_enex_import(
         report.elapsed_seconds = time.monotonic() - started
         return report
 
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    markdown_folder = config.state_path.parent / f"{MARKDOWN_STAGING_DIRNAME}-{stamp}"
+    by_markdown = [item for item in pending if markdown and routes_through_markdown(item[0])]
+    by_archive = [item for item in pending if not (markdown and routes_through_markdown(item[0]))]
     if adopt_landing is None:
-        _write_enex(target, pending, report)
+        if by_archive:
+            _write_enex(target, by_archive, report)
+        if by_markdown:
+            for stale in config.state_path.parent.glob(f"{MARKDOWN_STAGING_DIRNAME}*"):
+                shutil.rmtree(stale)
+            _write_markdown_folder(markdown_folder, [source for source, _note in by_markdown])
+            report.markdown_path = str(markdown_folder)
+            report.markdown_notes = len(by_markdown)
 
     if config.dry_run:
         report.elapsed_seconds = time.monotonic() - started
@@ -681,12 +843,20 @@ def run_enex_import(
         raise NotesError("a Notes runner is required for a real (non-dry-run) import")
 
     with notes_run_lock(config.state_path.parent):
+        batches: list[tuple[Path, str | None, list[tuple[NoteSource, NoteEnml]]]] = []
+        if adopt_landing is not None:
+            batches.append((target, None, pending))
+        else:
+            if by_archive:
+                batches.append((target, None, by_archive))
+            if by_markdown:
+                batches.append((markdown_folder, markdown_folder.name, by_markdown))
         return _import_into_notes(
             runner,
             report,
             state,
-            pending,
-            target,
+            batches,
+            markdown=markdown,
             started=started,
             confirm=confirm,
             timeout_seconds=timeout_seconds,
@@ -698,48 +868,45 @@ def _import_into_notes(
     runner: EnexNotesRunnerProtocol,
     report: EnexImportReport,
     state: NotesState,
-    pending: Sequence[tuple[NoteSource, NoteEnml]],
-    target: Path,
+    batches: Sequence[tuple[Path, str | None, Sequence[tuple[NoteSource, NoteEnml]]]],
     *,
+    markdown: bool,
     started: float,
     confirm: bool,
     timeout_seconds: float,
     adopt_landing: str | None,
 ) -> EnexImportReport:
-    """Hand the archive to Notes and file what comes back. Holds the run lock."""
+    """Hand each batch to Notes and file what comes back. Holds the run lock.
+
+    A batch is `(path, child, pending)`: the archive or Markdown folder to
+    open, the folder Notes nests the notes in inside its landing folder
+    (`None` for an archive, whose notes land directly in it), and the sources
+    the batch carries. Batches run one after the other, each with its own
+    confirmation, and share one deadline.
+    """
     account = runner.resolve_account(local=False)
     deadline = time.monotonic() + timeout_seconds
-
-    if adopt_landing is not None:
-        landing_name = adopt_landing
-        landing_id = runner.folder_id_by_name(account, adopt_landing)
-        if not landing_id:
-            raise NotesError(f"no folder named {adopt_landing!r} in the {account} account")
-        logger.warning("Adopting the notes already in %r; nothing will be imported.", adopt_landing)
-    else:
-        before = runner.folder_names(account)
-        if confirm:
-            logger.warning(
-                "Notes will now ask you to confirm the import. Click 'Import' in the "
-                "dialog; this run waits up to %.0f minutes.",
-                timeout_seconds / 60,
-            )
-        runner.open_enex(target)
-        landing_name, landing_id = _await_landing_folder(runner, account, before, deadline)
-
-    report.landing_folder = landing_name
-    if adopt_landing is not None:
-        # Adopted notes were already there when the run started, so there is
-        # nothing to wait for. Polling would re-read every body twice over.
-        imported = runner.notes_in_folder(landing_id)
-    else:
-        imported = _await_landing_notes(runner, landing_name, landing_id, len(pending), deadline)
-    report.imported = len(imported)
-
+    landings: list[str] = []
     try:
-        _file_imported_notes(runner, account, imported, pending, state, report)
+        for path, child, pending in batches:
+            landings.append(
+                _import_batch(
+                    runner,
+                    account,
+                    report,
+                    state,
+                    path,
+                    child,
+                    pending,
+                    markdown=markdown,
+                    deadline=deadline,
+                    confirm=confirm,
+                    adopt_landing=adopt_landing,
+                )
+            )
     finally:
         state.flush()
+        report.landing_folder = ", ".join(landings)
         report.elapsed_seconds = time.monotonic() - started
 
     if report.superseded:
@@ -750,6 +917,64 @@ def _import_into_notes(
             report.superseded,
         )
     return report
+
+
+def _import_batch(
+    runner: EnexNotesRunnerProtocol,
+    account: str,
+    report: EnexImportReport,
+    state: NotesState,
+    target: Path,
+    child: str | None,
+    pending: Sequence[tuple[NoteSource, NoteEnml]],
+    *,
+    markdown: bool,
+    deadline: float,
+    confirm: bool,
+    adopt_landing: str | None,
+) -> str:
+    """Import one archive or Markdown folder and file its notes; returns the landing name."""
+    if adopt_landing is not None:
+        # "Imported Notes/quip2md-markdown-..." names a Markdown run's folder.
+        landing_name = adopt_landing
+        top, *nested = adopt_landing.split("/")
+        landing_id = runner.folder_id_by_name(account, top)
+        for name in nested:
+            landing_id = runner.child_folder_id(landing_id, name) if landing_id else ""
+        if not landing_id:
+            raise NotesError(f"no folder named {adopt_landing!r} in the {account} account")
+        logger.warning("Adopting the notes already in %r; nothing will be imported.", adopt_landing)
+    else:
+        before = _landing_snapshot(runner, account) if child is None else {}
+        if confirm:
+            logger.warning(
+                "Notes will now ask you to confirm the import of %s. Click 'Import' "
+                "in the dialog; this run waits up to %.0f minutes.",
+                target.name,
+                max(deadline - time.monotonic(), 0) / 60,
+            )
+        runner.open_enex(target)
+        if child is None:
+            landing_name, landing_id = _await_landing_folder(runner, account, before, deadline)
+        else:
+            landing_name, landing_id = _await_child_folder(runner, account, child, deadline)
+
+    if adopt_landing is not None:
+        # Adopted notes were already there when the run started, so there is
+        # nothing to wait for. Polling would re-read every body twice over.
+        imported = runner.notes_in_folder(landing_id)
+    else:
+        imported = _await_landing_notes(
+            runner,
+            landing_name,
+            landing_id,
+            len(pending),
+            deadline,
+            already_there=before.get(landing_name, frozenset()),
+        )
+    report.imported += len(imported)
+    _file_imported_notes(runner, account, imported, pending, state, report, markdown=markdown)
+    return landing_name
 
 
 def _write_enex(
@@ -768,6 +993,7 @@ def _select_pending(
     report: EnexImportReport,
     *,
     force: bool,
+    markdown: bool = False,
 ) -> list[tuple[NoteSource, NoteEnml]]:
     """Drop sources already in Notes with the content they would be given now.
 
@@ -810,34 +1036,81 @@ def _select_pending(
         )
         if unchanged and not force:
             report.skipped_unchanged += 1
-            if entry is not None and note.needs_indent_pass:
+            if entry is not None and _needs_indent_pass(source, note, markdown=markdown):
                 report.indent_targets.append((entry.note_id, source.title, note.checklist))
             continue
         pending.append((source, note))
     return pending
 
 
+def _landing_snapshot(runner: EnexNotesRunnerProtocol, account: str) -> dict[str, frozenset[str]]:
+    """Ids of the notes already in each landing folder, before an archive opens."""
+    return {
+        name: frozenset(
+            note.note_id for note in runner.notes_in_folder(runner.folder_id_by_name(account, name))
+        )
+        for name in runner.folder_names(account)
+        if name.startswith(LANDING_FOLDER_PREFIX)
+    }
+
+
 def _await_landing_folder(
     runner: EnexNotesRunnerProtocol,
     account: str,
-    before: frozenset[str],
+    before: dict[str, frozenset[str]],
     deadline: float,
 ) -> tuple[str, str]:
-    """Block until Notes creates a landing folder that did not exist before."""
+    """Block until an archive's notes start arriving; return their folder.
+
+    Older Notes put each import in a fresh, numbered "Imported Notes N"
+    folder. Notes 4.13 adds to an existing "Imported Notes" folder instead, so
+    a folder that was already there counts once it holds a note it did not.
+    """
     while time.monotonic() < deadline:
-        new = {
-            name
-            for name in runner.folder_names(account) - before
-            if name.startswith(LANDING_FOLDER_PREFIX)
-        }
+        names = runner.folder_names(account)
+        new = {name for name in names if name.startswith(LANDING_FOLDER_PREFIX)} - set(before)
         if new:
             # Newest last: "Imported Notes 9" sorts after "Imported Notes 1".
             chosen = sorted(new, key=lambda name: (len(name), name))[-1]
             return chosen, runner.folder_id_by_name(account, chosen)
+        for name, ids in before.items():
+            if name not in names:
+                continue
+            folder_id = runner.folder_id_by_name(account, name)
+            if any(note.note_id not in ids for note in runner.notes_in_folder(folder_id)):
+                return name, folder_id
         time.sleep(IMPORT_POLL_INTERVAL_SECONDS)
     raise NotesError(
         "timed out waiting for Notes to create an import folder -- was the 'Import' button clicked?"
     )
+
+
+def _await_child_folder(
+    runner: EnexNotesRunnerProtocol, account: str, child: str, deadline: float
+) -> tuple[str, str]:
+    """Block until `child` appears inside any landing folder.
+
+    A folder import nests into an existing "Imported Notes" folder rather than
+    creating a new one, so there is no new top-level folder to wait for. The
+    child's name is unique to this run, which makes finding it unambiguous.
+    """
+    while time.monotonic() < deadline:
+        for name in sorted(runner.folder_names(account)):
+            if not name.startswith(LANDING_FOLDER_PREFIX):
+                continue
+            child_id = runner.child_folder_id(runner.folder_id_by_name(account, name), child)
+            if child_id:
+                return f"{name}/{child}", child_id
+        time.sleep(IMPORT_POLL_INTERVAL_SECONDS)
+    raise NotesError(
+        f"timed out waiting for Notes to create the folder {child!r} -- was the "
+        "'Import' button clicked?"
+    )
+
+
+def _needs_indent_pass(source: NoteSource, note: NoteEnml, *, markdown: bool) -> bool:
+    """Only an archive import flattens checklists; the Markdown route keeps them."""
+    return note.needs_indent_pass and not (markdown and routes_through_markdown(source))
 
 
 def _await_landing_notes(
@@ -846,8 +1119,13 @@ def _await_landing_notes(
     landing_id: str,
     expected: int,
     deadline: float,
+    *,
+    already_there: frozenset[str] = frozenset(),
 ) -> list[ImportedNote]:
     """Poll the landing folder until it stops filling up.
+
+    `already_there` are ids the folder held before this import; they belong to
+    someone else and are neither waited for nor returned.
 
     The folder appears as soon as the import starts, not when it finishes: on
     a large archive Notes keeps adding notes to it for minutes. Reading it once
@@ -855,7 +1133,11 @@ def _await_landing_notes(
     count to hold steady across two polls *and* reach the archive's own note
     count before returning.
     """
-    notes = runner.notes_in_folder(landing_id)
+
+    def arrived() -> list[ImportedNote]:
+        return [n for n in runner.notes_in_folder(landing_id) if n.note_id not in already_there]
+
+    notes = arrived()
     previous = -1
     while len(notes) != previous or len(notes) < expected:
         if time.monotonic() >= deadline:
@@ -871,7 +1153,7 @@ def _await_landing_notes(
             break
         previous = len(notes)
         time.sleep(IMPORT_POLL_INTERVAL_SECONDS)
-        notes = runner.notes_in_folder(landing_id)
+        notes = arrived()
     return notes
 
 
@@ -882,6 +1164,8 @@ def _file_imported_notes(
     pending: Sequence[tuple[NoteSource, NoteEnml]],
     state: NotesState,
     report: EnexImportReport,
+    *,
+    markdown: bool = False,
 ) -> None:
     by_url = {source.quip_url: (source, note) for source, note in pending if source.quip_url}
     imported_at = _now_iso8601()
@@ -902,7 +1186,7 @@ def _file_imported_notes(
             report.failed.append((source.key, f"move failed: {_error_reason(exc)}"))
             continue
 
-        if enml.needs_indent_pass:
+        if _needs_indent_pass(source, enml, markdown=markdown):
             report.indent_targets.append((note.note_id, source.title, enml.checklist))
         previous = state.get(source.key)
         superseded: tuple[str, ...] = ()

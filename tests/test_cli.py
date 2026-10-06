@@ -512,6 +512,9 @@ class _FakeEnexRunner:
     def move_note(self, note_id: str, folder_id: str) -> None:
         self.moved.append((note_id, folder_id))
 
+    def child_folder_id(self, parent_id: str, name: str) -> str:
+        return f"{parent_id}/{name}"
+
     def open_enex(self, path: Path) -> None:
         self.opened.append(path)
         self._imported = True
