@@ -325,7 +325,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "After importing, drive the Notes editor to restore nested "
             "checklist indentation. Needs Accessibility permission and types "
-            "into your notes; off by default. Only valid with --writer enex."
+            "into your notes; off by default. Not valid with --writer applescript."
         ),
     )
 
