@@ -163,11 +163,8 @@ Thread `type` counts observed (sample, see coverage note above):
 
 ## Fixtures saved
 
-- `tests/fixtures/doc_sample_THREAD0001.html`
-- `tests/fixtures/doc_headings_lists_code_THREAD0010.html`
-- `tests/fixtures/spreadsheet_THREAD0009.html`
-- `tests/fixtures/doc_sample_THREAD0011.html`
-- `tests/fixtures/doc_sample_THREAD0012.html`
+The recon run saved five thread HTML fixtures. They were later anonymized
+and renamed with placeholder ids; see `tests/fixtures/`.
 
 ## Raw request log
 
