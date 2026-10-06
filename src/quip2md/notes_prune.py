@@ -3,7 +3,7 @@
 Every other module here is additive on purpose -- `notes_enex` never deletes,
 it records a replaced note's id in `NoteStateEntry.superseded_note_ids` and
 says so. That is the right default, but it means a migration accumulates: one
-superseded copy per re-import, plus an empty `Imported Notes N` folder per run.
+superseded copy per re-import, plus an empty landing folder per run.
 This module is the one place allowed to remove them, and it is deliberately
 awkward to fire: nothing happens without `apply=True`.
 
@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Protocol
 
 from quip2md.config import Config
-from quip2md.notes_enex import NOTES_STATE_FILENAME
+from quip2md.notes_enex import MARKDOWN_STAGING_DIRNAME, NOTES_STATE_FILENAME
 from quip2md.notes_import import NotesError, NotesState, NoteStateEntry, notes_run_lock
 
 logger = logging.getLogger("quip2md.notes_prune")
@@ -48,10 +48,17 @@ class FolderInfo:
     folder_id: str
     notes: int
     subfolders: int
+    #: Subfolders that are an empty Markdown-import staging folder.
+    empty_staging: int = 0
 
     @property
     def is_empty(self) -> bool:
         return self.notes == 0 and self.subfolders == 0
+
+    @property
+    def is_spent_landing(self) -> bool:
+        """No notes, and no subfolders other than empty staging folders."""
+        return self.notes == 0 and self.subfolders == self.empty_staging
 
 
 @dataclass(slots=True)
@@ -129,7 +136,7 @@ def _plan_or_prune(
         wanted += [
             info.name
             for info in top.values()
-            if info.name.startswith("Imported Notes") and info.is_empty
+            if info.name.startswith("Imported Notes") and info.is_spent_landing
         ]
 
     for name in dict.fromkeys(wanted):
@@ -243,6 +250,7 @@ def _without_superseded(entry: NoteStateEntry, kept: Sequence[str]) -> NoteState
 _AS_TOP_LEVEL_FOLDERS = """
 on run argv
     set acc to item 1 of argv
+    set stagingPrefix to item 2 of argv
     tell application "Notes"
         if acc is "" then
             set theAccount to default account
@@ -257,9 +265,15 @@ on run argv
                 if (id of container of f) is accId then set isTop to true
             end try
             if isTop then
+                set staged to 0
+                repeat with c in folders of f
+                    if (name of c) starts with stagingPrefix and (count of notes of c) is 0 ¬
+                        and (count of folders of c) is 0 then set staged to staged + 1
+                end repeat
                 set out to out & (name of f) & (ASCII character 31) & (id of f) & ¬
                     (ASCII character 31) & (count of notes of f) & (ASCII character 31) & ¬
-                    (count of folders of f) & (ASCII character 30)
+                    (count of folders of f) & (ASCII character 31) & staged & ¬
+                    (ASCII character 30)
             end if
         end repeat
         return out
@@ -298,13 +312,13 @@ class PruneRunner:
     def top_level_folders(self, account: str) -> list[FolderInfo]:
         from quip2md.notes_enex import _FIELD_SEPARATOR, _RECORD_SEPARATOR
 
-        stdout = self._inner._run(_AS_TOP_LEVEL_FOLDERS, [account])
+        stdout = self._inner._run(_AS_TOP_LEVEL_FOLDERS, [account, MARKDOWN_STAGING_DIRNAME])
         folders: list[FolderInfo] = []
         for record in stdout.split(_RECORD_SEPARATOR):
             if not record.strip():
                 continue
             parts = record.split(_FIELD_SEPARATOR)
-            if len(parts) < 4:
+            if len(parts) < 5:
                 continue
             try:
                 folders.append(
@@ -313,6 +327,7 @@ class PruneRunner:
                         folder_id=parts[1].strip(),
                         notes=int(parts[2].strip()),
                         subfolders=int(parts[3].strip()),
+                        empty_staging=int(parts[4].strip()),
                     )
                 )
             except ValueError as exc:

@@ -347,7 +347,10 @@ def _build_parser() -> argparse.ArgumentParser:
     prune_parser.add_argument(
         "--empty-landing",
         action="store_true",
-        help="Delete every empty 'Imported Notes N' folder.",
+        help=(
+            "Delete every 'Imported Notes' folder that holds no notes and no "
+            "subfolders other than empty Markdown staging folders."
+        ),
     )
     prune_parser.add_argument(
         "--superseded",

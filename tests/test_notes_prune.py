@@ -172,6 +172,23 @@ def test_only_empty_landing_folders_are_swept(tmp_path: Path) -> None:
     assert "d" not in runner.deleted_folders
 
 
+def test_a_landing_folder_holding_only_empty_staging_folders_is_swept(
+    tmp_path: Path,
+) -> None:
+    """A Markdown import nests its staging folder in an `Imported Notes` folder."""
+    runner = FakePruneRunner(
+        folders=[
+            FolderInfo("Imported Notes", "a", 0, 2, empty_staging=2),
+            FolderInfo("Imported Notes 2", "b", 0, 2, empty_staging=1),
+            FolderInfo("Imported Notes 3", "c", 1, 1, empty_staging=1),
+        ]
+    )
+    report = prune_notes(runner, _config(tmp_path), empty_landing=True, apply=True)
+
+    assert report.folders_deleted == ["Imported Notes"]
+    assert runner.deleted_folders == ["a"]
+
+
 def test_superseded_notes_are_deleted_and_forgotten(tmp_path: Path) -> None:
     runner = FakePruneRunner()
     _write_state(tmp_path, {"T1": _entry("live-1", superseded=["old-a", "old-b"])})
@@ -298,29 +315,33 @@ def _runner() -> PruneRunner:
 def test_top_level_folders_parses_the_record_and_field_separators(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _stub_osascript(
+    seen = _stub_osascript(
         monkeypatch,
-        stdout="Quip\x1ffolder-1\x1f0\x1f2\x1e   \x1eQuip-Old\x1ffolder-2\x1f492\x1f3\x1e",
+        stdout=(
+            "Quip\x1ffolder-1\x1f0\x1f2\x1f0\x1e   \x1e"
+            "Imported Notes\x1ffolder-2\x1f0\x1f1\x1f1\x1e"
+        ),
     )
     folders = _runner().top_level_folders("iCloud")
 
     assert folders == [
         FolderInfo("Quip", "folder-1", 0, 2),
-        FolderInfo("Quip-Old", "folder-2", 492, 3),
+        FolderInfo("Imported Notes", "folder-2", 0, 1, empty_staging=1),
     ]
+    assert seen[0][-2:] == ["iCloud", "quip2md-markdown"]
 
 
 def test_a_folder_line_that_is_not_numbers_is_an_error_not_a_guess(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Mis-reading a count could make a folder full of notes look empty."""
-    _stub_osascript(monkeypatch, stdout="Quip\x1ffolder-1\x1fmany\x1f2\x1e")
+    _stub_osascript(monkeypatch, stdout="Quip\x1ffolder-1\x1fmany\x1f2\x1f0\x1e")
     with pytest.raises(NotesError, match="could not read the folder list"):
         _runner().top_level_folders("iCloud")
 
 
 def test_a_short_folder_record_is_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
-    _stub_osascript(monkeypatch, stdout="truncated\x1frecord\x1e")
+    _stub_osascript(monkeypatch, stdout="truncated\x1frecord\x1f0\x1f0\x1e")
     assert _runner().top_level_folders("iCloud") == []
 
 

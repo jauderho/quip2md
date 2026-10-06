@@ -343,7 +343,7 @@ uv run quip2md prune-notes --superseded --empty-landing
 | Flag | Effect |
 |---|---|
 | `--superseded` | Delete the previous copy of every re-imported note, by the exact id recorded in `notes_state.json`, then clear those records. Never deletes an id that is still some document's current note. |
-| `--empty-landing` | Delete every *empty* top-level `Imported Notes` / `Imported Notes N` folder. A folder that still holds an empty `quip2md-markdown-…` subfolder is not empty, so it is skipped; check it has no notes, then remove it with `--folder "Imported Notes"`. |
+| `--empty-landing` | Delete every top-level `Imported Notes` / `Imported Notes N` folder that holds no notes and no subfolders other than empty `quip2md-markdown-…` staging folders. |
 | `--folder NAME` | Delete a named top-level folder and everything in it. Repeatable. Refuses anything that is not a top-level folder of the account, and refuses `Quip` outright. |
 | `--apply` | Actually delete. Without it the plan is printed and nothing is touched. |
 
