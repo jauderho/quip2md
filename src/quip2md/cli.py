@@ -265,7 +265,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Re-import every note even if unchanged since the last run. With "
-            "--writer enex this adds a second note per document; the previous "
+            "--writer markdown or enex this adds a second note per document; the previous "
             "copy is recorded as superseded and left in Notes."
         ),
     )
@@ -303,9 +303,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="N",
         help=(
-            "Worker processes used to render the archive (--writer enex only; "
-            "default: the smaller of the CPU count and 6). 1 renders in this "
-            "process."
+            "Worker processes used to render the archive (not used by --writer "
+            "applescript; default: the smaller of the CPU count and 6). 1 "
+            "renders in this process."
         ),
     )
     notes_parser.add_argument(
@@ -314,8 +314,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Resume an import whose notes reached Notes but were never filed "
-            "(--writer enex only). Imports nothing; files the notes already in "
-            "the named 'Imported Notes N' folder. Use this instead of re-running "
+            "(not valid with --writer applescript). Imports nothing; files the "
+            "notes already in the named landing folder. Use this instead of re-running "
             "after a failure, which would import a second copy of everything."
         ),
     )

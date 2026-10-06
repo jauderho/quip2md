@@ -91,7 +91,7 @@ than starting over.
 
 ## Time expectations
 
-Measured on a real personal account (492 threads):
+Measured on a personal account with 492 threads:
 
 - Full export: ~57 seconds, ~35 batched API requests, 29 images downloaded,
   zero failures.
@@ -133,10 +133,13 @@ All flags are under the `import-notes` subcommand.
 | `--local` | Target the "On My Mac" Notes account instead of the default account (usually iCloud). Only valid with `--writer applescript`; rejected (exit 2) with the `markdown` and `enex` writers, which always import into the default account. |
 | `--dryrun` | Scan and convert every source under `--source`, printing per-folder note counts; makes zero Notes automation calls and writes no `.quip2md/notes_state.json`. |
 | `--verbose`, `-v` | Enable step-level DEBUG logging. Silent (warnings and above only) by default. |
-| `--force` | Re-import every note even if the state file says it's unchanged since the last run. With `--writer enex` this creates a second note per document; the previous copy is recorded as superseded and left in Notes for you to delete. |
+| `--writer {markdown,enex,applescript}` | How notes reach Notes. Defaults to `markdown` on Notes 4.13 (macOS 27) and later, otherwise `enex`. See [Import writers](#import-writers). An explicit `markdown` on older Notes is rejected (exit 2). |
+| `--force` | Re-import every note even if the state file says it's unchanged since the last run. With `--writer markdown` or `enex` this creates a second note per document; the previous copy is recorded as superseded and left in Notes for you to delete. |
 | `--only KEY` | Restrict the import to one note: a Quip thread id (from a source file's `quip_id` frontmatter), or, for a file without that frontmatter, its `path:<relative/posix/path>` key. Repeatable. |
-| `--adopt-landing FOLDER` | Resume an import whose notes reached Notes but were never filed, e.g. one that failed after you clicked Import. Imports nothing; files the notes already sitting in the named `Imported Notes N` folder and records them in the state file. Use this instead of re-running, which would import a second copy of every document. `--writer enex` only. |
-| `--workers N` | Number of processes used to render Markdown to ENML with `--writer enex`. Defaults to the CPU count capped at 6 (measured optimum on a 4P+4E Apple Silicon machine; a homogeneous x86-64 box may benefit from more). `1` renders in-process. Output is byte-identical at any setting. |
+| `--enex-file PATH` | Where to write the Evernote archive. Defaults to `.quip2md/quip2md.enex`. |
+| `--adopt-landing FOLDER` | Resume an import whose notes reached Notes but were never filed, e.g. one that failed after you clicked Import. Imports nothing; files the notes already sitting in the named landing folder and records them in the state file. For a Markdown import, name the nested folder as `"Imported Notes/quip2md-markdown-<stamp>"`. Use this instead of re-running, which would import a second copy of every document. Rejected with `--writer applescript`. |
+| `--workers N` | Number of processes used to render Markdown to ENML for the archive (`markdown` and `enex` writers). Defaults to the CPU count capped at 6 (measured optimum on a 4P+4E Apple Silicon machine; a homogeneous x86-64 box may benefit from more). `1` renders in-process. Output is byte-identical at any setting. |
+| `--indent-checklists` | After the import, drive the Notes editor to restore nested checklist levels in notes that came through the archive. Needs Accessibility permission (see below) and changes each touched note's modification date. Off by default; rejected with `--writer applescript`. |
 
 ### macOS requirement and permissions
 
@@ -165,7 +168,12 @@ whatever the permissions say. That is Notes' confirmation, not a permission.
 - A single top-level **Quip** folder in the target account, with the rest
   of the tree mirrored underneath it exactly as it appears under `export/`.
 - One note per source Markdown file, converted from its frontmatter + body.
-- Images embed as real inline attachments (not links).
+  Each note starts with the document title and a `Source:` link to the
+  original Quip document.
+- With the `markdown` writer, each note keeps the Quip document's creation
+  and modification dates.
+- Images embed as real inline attachments (not links). Documents with images
+  always go through the archive for this reason.
 
 ### Re-run / update behavior
 
@@ -173,19 +181,20 @@ State lives in `.quip2md/notes_state.json` (thread id/path key -> note id +
 source hash). Re-running the same command:
 
 - Skips notes whose source hasn't changed since the last run — no
-  duplicates are created. With the `enex` writer, a run in which everything is
-  unchanged writes no archive and never opens Notes at all.
+  duplicates are created. With the `markdown` and `enex` writers, a run in
+  which everything is unchanged writes nothing and never opens Notes at all.
 - Handles a changed source differently per writer:
   - `applescript` updates the note in place (same note, same id).
-  - `enex` **imports a second note**: Notes' importer cannot replace an
-    existing note, and rewriting the body would destroy exactly the links and
+  - `markdown` and `enex` **import a second note**: Notes' importer cannot
+    replace an existing note, and rewriting the body would destroy exactly the links and
     checklists this writer exists to preserve. The new note takes over the
     state entry, the old note's id is recorded under `superseded_note_ids`,
     and the run ends with a warning telling you how many stale copies are
     still in Notes. **Nothing is ever deleted for you** — delete the old
     copies by hand.
-- `--force` re-pushes every note regardless of the state file (with `enex`,
-  that means a duplicate of every note, each one superseding its predecessor).
+- `--force` re-pushes every note regardless of the state file (with `markdown`
+  or `enex`, that means a duplicate of every note, each one superseding its
+  predecessor).
 
 If interrupted with Ctrl-C, the process exits with status 130. State is
 flushed to disk per folder, so re-running the same command resumes safely
@@ -206,7 +215,11 @@ nested, so no indentation pass is needed. Two kinds of document stay on the
 `enex` route, because the Markdown importer loses content from them: documents
 with images (it never embeds an image, only links to it) and documents with a
 URL inside a table (it empties that cell and every cell after it). The whole
-staging folder imports with one confirmation, and the archive with a second.
+staging folder (`.quip2md/quip2md-markdown-<UTC timestamp>`, replaced on the
+next run) imports with one confirmation, and the archive with a second. Notes
+places the staging folder inside an `Imported Notes` folder; the run finds it
+there by its unique name, files its notes under `Quip`, and leaves the empty
+folders behind (see [Cleaning up after an import](#cleaning-up-after-an-import)).
 One limitation: the Markdown importer makes every line of a multi-line list
 item into its own item, so such an item arrives as several checkboxes; no text
 is lost.
@@ -256,29 +269,36 @@ Notes and comparing them with what was sent:
 | Hyperlinks, including the source link | Real clickable links |
 | Images | Embedded attachments |
 
-Across all 492 documents the renderer raises only 40 fidelity warnings, so the
-list below is genuinely everything that does not survive.
+On a 492-document account the renderer raised only 40 fidelity warnings, so
+the list below is everything that does not survive.
 
 ### Fidelity caveats
 
-With the `enex` writer, Apple Notes still normalizes some things:
+With the `markdown` writer, Notes' Markdown importer:
+
+- Splits a list item that spans several lines into one item per line, so a
+  multi-line checklist item arrives as several checkboxes. No text is lost.
+- Never embeds images and drops table cells after a URL. The run sends those
+  documents through the archive instead, so they get the `enex` caveats below.
+
+With the `enex` writer (and the archive part of a `markdown` run), Apple Notes
+still normalizes some things:
 
 - Nested checklists import flat unless `--indent-checklists` is used (the
   `markdown` writer keeps them nested).
-- Blockquotes keep their text but lose the quote styling (1 in this corpus).
-- Horizontal rules are dropped (6).
+- Blockquotes keep their text but lose the quote styling.
+- Horizontal rules are dropped.
 - Links with schemes outside `https`, `http`, `mailto` and `tel` render as
-  text (5, all malformed in the source).
+  text.
 - A list that mixes checklist and plain items keeps the plain ones as bullets
-  at their own depth (28).
+  at their own depth.
 
 Two things are worth knowing because they are Notes bugs rather than choices:
 
 - **Angle brackets are escaped twice.** Notes decodes an imported note's
   content and then re-parses the result as HTML, so a correctly escaped
   `&lt;profile name&gt;` becomes an element on the second pass and the text
-  disappears. Writing `&amp;lt;` instead survives. 141 occurrences in this
-  corpus depended on it.
+  disappears. Writing `&amp;lt;` instead survives.
 - **`--indent-checklists` changes a note's modification date, and that cannot
   be undone.** Notes exposes `modification date` as read-only (AppleScript
   error `-10006`), and the only supported way to set it is at *import* time —
@@ -292,7 +312,7 @@ the working copy, `export/` is the archive.
 
 ### Time expectations
 
-Measured on the same real personal account (492 notes):
+Measured on the same account (492 notes) with `--writer enex`:
 
 - Full import: 92.6 seconds, zero failures.
 - Immediate re-run (nothing changed): ~16 seconds, all 492 notes
@@ -312,7 +332,8 @@ and `prune-notes` plans read only and are never blocked.
 
 `import-notes` never deletes anything. A re-imported document leaves its
 previous copy in Notes (recorded under `superseded_note_ids`), and every run
-leaves an empty `Imported Notes N` folder behind. `prune-notes` is the one
+leaves an empty landing folder (`Imported Notes`, `Imported Notes N`, or a
+`quip2md-markdown-…` folder inside one) behind. `prune-notes` is the one
 command that removes them, and it does nothing without `--apply`:
 
 ```bash
@@ -322,7 +343,7 @@ uv run quip2md prune-notes --superseded --empty-landing
 | Flag | Effect |
 |---|---|
 | `--superseded` | Delete the previous copy of every re-imported note, by the exact id recorded in `notes_state.json`, then clear those records. Never deletes an id that is still some document's current note. |
-| `--empty-landing` | Delete every *empty* `Imported Notes N` folder. |
+| `--empty-landing` | Delete every *empty* top-level `Imported Notes` / `Imported Notes N` folder. A folder that still holds an empty `quip2md-markdown-…` subfolder is not empty, so it is skipped; check it has no notes, then remove it with `--folder "Imported Notes"`. |
 | `--folder NAME` | Delete a named top-level folder and everything in it. Repeatable. Refuses anything that is not a top-level folder of the account, and refuses `Quip` outright. |
 | `--apply` | Actually delete. Without it the plan is printed and nothing is touched. |
 
@@ -335,9 +356,8 @@ recoverable for thirty days.
 
 **Order matters.** Notes does not persist deleting a folder that still holds
 notes — it reports success and the folder is back moments later, which was
-observed live on iCloud with a 492-note folder while the empty ones stayed
-gone. Empty a folder first (`--superseded`), then delete it. `prune-notes`
-re-reads the account after deleting and reports any folder that came back
+observed on iCloud with a large folder while the empty ones stayed gone.
+Empty a folder first (`--superseded`), then delete it. `prune-notes` re-reads the account after deleting and reports any folder that came back
 rather than claiming a deletion that undid itself.
 
 ## Troubleshooting
@@ -348,6 +368,7 @@ rather than claiming a deletion that undid itself.
 | `429` / `503` in verbose logs | Normal rate-limit backoff during `export` — the client handles retries automatically. Just let it run. |
 | Corrupted `.quip2md/state.json` | `export` prints a clear manifest error and exits with status 2 rather than silently continuing. Delete `.quip2md/state.json` to start a fresh export (you'll lose incremental skip state, not any exported files). |
 | Corrupted `.quip2md/notes_state.json` | `import-notes` prints a clear state error and exits with status 2. Deleting the file lets the next run proceed, but since it wipes the id/hash mapping, that next run will recreate every note as a duplicate. If you actually want to start over, delete the **Quip** folder in Notes.app first, then delete `.quip2md/notes_state.json` and re-run. |
+| `--writer markdown needs Notes 4.13` | This Notes cannot import Markdown. Use `--writer enex`, or omit `--writer` to get the right default. |
 | `import-notes` on a non-macOS platform, or missing "On My Mac" account with `--local` | Exits with status 2 and a clear message — this subcommand only works on macOS with Notes.app configured accordingly. |
 
 ### Exit codes
@@ -355,6 +376,6 @@ rather than claiming a deletion that undid itself.
 | Code | Meaning |
 |---|---|
 | `0` | Success, nothing failed. |
-| `1` | One or more threads failed to export, or one or more notes failed to import or could not be matched back to a source (the `enex` writer leaves those in its landing folder, whose name the report prints). See the printed report and `.quip2md/last_run.json` / `.quip2md/last_notes_run.json`. |
-| `2` | A rejected flag combination (`--local` with `--writer enex`, `--indent-checklists` with `--writer applescript`), or a configuration, manifest, or Notes-state error: missing `QUIP_TOKEN` (export), a corrupted `state.json`/`notes_state.json`, an API error during the initial folder walk, or, for `import-notes`, a non-macOS platform or a missing "On My Mac" account. A clear message is printed to stderr, no traceback. |
+| `1` | One or more threads failed to export, or one or more notes failed to import or could not be matched back to a source (the `markdown` and `enex` writers leave those in their landing folder, whose name the report prints). See the printed report and `.quip2md/last_run.json` / `.quip2md/last_notes_run.json`. |
+| `2` | A rejected flag combination (`--local` with `--writer markdown` or `enex`, `--indent-checklists` or `--adopt-landing` with `--writer applescript`, `--writer markdown` on Notes older than 4.13), or a configuration, manifest, or Notes-state error: missing `QUIP_TOKEN` (export), a corrupted `state.json`/`notes_state.json`, an API error during the initial folder walk, or, for `import-notes`, a non-macOS platform or a missing "On My Mac" account. A clear message is printed to stderr, no traceback. |
 | `130` | Interrupted (Ctrl-C). The manifest/state file was already flushed; re-run the same command to resume. |
