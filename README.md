@@ -130,7 +130,7 @@ All flags are under the `import-notes` subcommand.
 | Flag | Effect |
 |---|---|
 | `--source DIR` | Directory containing the Markdown tree an earlier `quip2md export` run wrote. Defaults to `./export`. |
-| `--local` | Target the "On My Mac" Notes account instead of the default account (usually iCloud). Only valid with `--writer applescript`; rejected (exit 2) with the default `enex` writer, which always imports into the default account. |
+| `--local` | Target the "On My Mac" Notes account instead of the default account (usually iCloud). Only valid with `--writer applescript`; rejected (exit 2) with the `markdown` and `enex` writers, which always import into the default account. |
 | `--dryrun` | Scan and convert every source under `--source`, printing per-folder note counts; makes zero Notes automation calls and writes no `.quip2md/notes_state.json`. |
 | `--verbose`, `-v` | Enable step-level DEBUG logging. Silent (warnings and above only) by default. |
 | `--force` | Re-import every note even if the state file says it's unchanged since the last run. With `--writer enex` this creates a second note per document; the previous copy is recorded as superseded and left in Notes for you to delete. |
@@ -193,13 +193,30 @@ without duplicating notes already imported.
 
 ### Import writers
 
-`import-notes` has two writers. `--writer enex` is the default.
+`import-notes` has three writers. `--writer markdown` is the default where
+Notes can import Markdown (Notes 4.13, macOS 27 and later); `--writer enex` is
+the default elsewhere.
 
-**`enex` (default)** renders every document that has changed since the last run
+**`markdown` (default on Notes 4.13+)** keeps both of every document's dates and
+its nested checklists. Each document without an image is staged as a Markdown
+file whose birth time and modification time are set to the Quip document's
+`created` and `updated` timestamps; Notes' Markdown importer takes the note's
+creation and modification dates from them and builds checklists natively
+nested, so no indentation pass is needed. Two kinds of document stay on the
+`enex` route, because the Markdown importer loses content from them: documents
+with images (it never embeds an image, only links to it) and documents with a
+URL inside a table (it empties that cell and every cell after it). The whole
+staging folder imports with one confirmation, and the archive with a second.
+One limitation: the Markdown importer makes every line of a multi-line list
+item into its own item, so such an item arrives as several checkboxes; no text
+is lost.
+
+**`enex`** renders every document that has changed since the last run
 into one Evernote archive and hands it to Notes' own importer. Notes shows a
-single confirmation sheet — click **Import** — then fills a fresh
-`Imported Notes N` folder, which the run polls until its note count stops
-growing. Each note is then matched back to its source by the Quip URL on its
+single confirmation sheet — click **Import** — then fills an `Imported Notes`
+folder (a fresh numbered one on older Notes; Notes 4.13 adds to an existing
+one, so the run looks for notes that were not there before), which the run
+polls until its note count stops growing. Each note is then matched back to its source by the Quip URL on its
 `Source:` provenance line (only that line counts, so a link to another exported
 document cannot mis-file a note) and moved into its mirrored folder under
 `Quip`. Notes it cannot match are left there and listed in the report, and the
@@ -244,9 +261,10 @@ list below is genuinely everything that does not survive.
 
 ### Fidelity caveats
 
-With the default `enex` writer, Apple Notes still normalizes some things:
+With the `enex` writer, Apple Notes still normalizes some things:
 
-- Nested checklists import flat unless `--indent-checklists` is used.
+- Nested checklists import flat unless `--indent-checklists` is used (the
+  `markdown` writer keeps them nested).
 - Blockquotes keep their text but lose the quote styling (1 in this corpus).
 - Horizontal rules are dropped (6).
 - Links with schemes outside `https`, `http`, `mailto` and `tel` render as
@@ -263,12 +281,11 @@ Two things are worth knowing because they are Notes bugs rather than choices:
   corpus depended on it.
 - **`--indent-checklists` changes a note's modification date, and that cannot
   be undone.** Notes exposes `modification date` as read-only (AppleScript
-  error `-10006`), and the only supported way to set it is the `<updated>`
-  value in the archive at *import* time — which is necessarily before the
-  indentation is applied. The **creation** date is preserved, so sorting by
-  *Date Created* still reflects the original document; sorting by *Date
-  Edited* will show indented notes as recently touched. `export/` keeps the
-  true `updated` timestamp in each file's frontmatter either way.
+  error `-10006`), and the only supported way to set it is at *import* time —
+  which is necessarily before the indentation is applied. The `markdown`
+  writer avoids the problem: its notes need no indentation pass. It is only
+  needed for a document that has both nested checklists and an image or a
+  table URL, which stays on the `enex` route.
 
 `export/` remains the full-fidelity Markdown backup by design — Notes is
 the working copy, `export/` is the archive.
