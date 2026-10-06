@@ -624,15 +624,15 @@ def _set_file_dates(path: Path, *, created: str | None, updated: str | None) -> 
     Notes takes a note's creation date from the file's birth time and its
     modification date from the mtime. There is no call that sets a birth time,
     but lowering the mtime below it lowers the birth time too (APFS), so the
-    file is stamped with the earlier date first and then the modification date.
+    file is stamped with the creation date first and then the modification
+    date. A creation date after the modification date ends up as the latter.
     """
     stamps = [stamp for stamp in (_epoch(created), _epoch(updated)) if stamp is not None]
     if not stamps:
         return
     born = stamps[0]
     modified = stamps[-1]
-    earliest = min(born, modified)
-    os.utime(path, (earliest, earliest))
+    os.utime(path, (born, born))
     os.utime(path, (modified, modified))
 
 

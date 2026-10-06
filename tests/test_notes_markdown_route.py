@@ -411,3 +411,90 @@ def test_an_archive_that_lands_in_an_existing_folder_is_found(tmp_path: Path) ->
     assert report.unmatched == [], "the note that was already there is not this run's"
     assert report.imported == 1
     assert report.landing_folder == "Imported Notes 1"
+
+
+# --- Edge cases and the real runner's argv -------------------------------------
+
+
+def test_a_failed_second_import_keeps_the_first_imports_notes_recorded(tmp_path: Path) -> None:
+    """The archive's notes are filed and recorded even if the Markdown batch fails.
+
+    A re-run must then skip them, not import them a second time.
+    """
+    root = _corpus(tmp_path)
+
+    class MarkdownNeverLands(TwoRouteRunner):
+        def child_folder_id(self, parent_id: str, name: str) -> str:
+            return ""
+
+    runner = MarkdownNeverLands([[_note("n-pic", "THREAD0002")], []])
+    with pytest.raises(notes_enex.NotesError):
+        run_enex_import(runner, _config(tmp_path), source_dir=root, markdown=True)
+
+    state = json.loads((tmp_path / ".quip2md" / "notes_state.json").read_text())
+    assert list(state) == ["THREAD0002"]
+    assert runner.moved == [("n-pic", "folder:Quip/Private")]
+
+
+def test_a_creation_date_after_the_update_still_gives_a_valid_birth_time(tmp_path: Path) -> None:
+    path = tmp_path / "x.md"
+    path.write_text("x", encoding="utf-8")
+    notes_enex._set_file_dates(path, created="2021-01-02T00:00:00Z", updated="2020-01-01T00:00:00Z")
+    stat = path.stat()
+    assert stat.st_mtime == datetime(2020, 1, 1, tzinfo=UTC).timestamp()
+    if sys.platform == "darwin":
+        assert stat.st_birthtime <= stat.st_mtime
+
+
+def test_a_landing_folder_deleted_during_the_wait_times_out_cleanly(tmp_path: Path) -> None:
+    root = tmp_path / "export"
+    _write_doc(root, "Private/Pic.md", quip_id="THREAD0002", title="Pic", body="![p](x.png)\n")
+
+    class FolderDeleted(MergingRunner):
+        def folder_names(self, account: str) -> frozenset[str]:
+            return frozenset({"Notes"} if self.opened else {"Notes", "Imported Notes 1"})
+
+    runner = FolderDeleted([[]])
+    with pytest.raises(notes_enex.NotesError, match="import folder"):
+        run_enex_import(runner, _config(tmp_path), source_dir=root, markdown=True)
+    assert runner.moved == []
+
+
+def test_the_real_runner_looks_up_a_child_folder_through_argv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[list[str]] = []
+
+    @dataclass
+    class Done:
+        returncode: int = 0
+        stdout: str = "x-coredata://child\n"
+        stderr: str = ""
+
+    def fake_run(command: Sequence[str], *args: Any, **kwargs: Any) -> Done:
+        seen.append(list(command))
+        return Done()
+
+    monkeypatch.setattr(notes_enex.sys, "platform", "darwin")
+    monkeypatch.setattr(notes_enex.subprocess, "run", fake_run)
+    runner = notes_enex.EnexNotesRunner()
+
+    assert runner.child_folder_id("x-coredata://parent", 'odd" name') == "x-coredata://child"
+    assert seen[0][0] == "osascript"
+    assert seen[0][-2:] == ["x-coredata://parent", 'odd" name']
+
+
+def test_the_cli_report_names_the_markdown_folder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "markdown_import_available", lambda: True)
+
+    def fake_run(runner: object, config: Config, **kwargs: Any) -> notes_enex.EnexImportReport:
+        return notes_enex.EnexImportReport(markdown_path="stage", markdown_notes=3)
+
+    monkeypatch.setattr(cli, "run_enex_import", fake_run)
+    assert cli.main(["import-notes", "--dryrun"]) == 0
+    out = capsys.readouterr().out
+    assert "markdown:            stage (3 notes)" in out
+    assert "none written" not in out

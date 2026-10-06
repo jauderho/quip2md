@@ -831,3 +831,35 @@ def test_prune_notes_ctrl_c_flushes_state_and_a_rerun_resumes(
     assert rerun.deleted_notes == ["old-2"], "the re-run must not re-delete old-1"
     state = json.loads((tmp_path / ".quip2md" / "notes_state.json").read_text())
     assert state["T1"].get("superseded_note_ids", []) == []
+
+
+def test_a_corrupt_state_file_stops_prune_with_exit_2(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _install_prune_runner(monkeypatch, tmp_path, RecordingPruneRunner())
+    (tmp_path / ".quip2md").mkdir()
+    (tmp_path / ".quip2md" / "notes_state.json").write_text("{not json", encoding="utf-8")
+    assert cli.main(["prune-notes", "--superseded", "--apply"]) == 2
+    assert "notes state error" in capsys.readouterr().err
+
+
+def test_adopt_landing_with_the_applescript_writer_is_rejected(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["import-notes", "--writer", "applescript", "--adopt-landing", "Imported Notes"])
+    assert exc.value.code == 2
+    assert "--adopt-landing cannot be used" in capsys.readouterr().err
+
+
+def test_a_valid_worker_count_is_accepted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    seen: dict[str, object] = {}
+
+    def fake_run(runner: object, config: object, **kwargs: object) -> EnexImportReport:
+        seen.update(kwargs)
+        return EnexImportReport()
+
+    monkeypatch.setattr(cli, "run_enex_import", fake_run)
+    assert cli.main(["import-notes", "--dryrun", "--workers", "3"]) == 0
+    assert seen["workers"] == 3
