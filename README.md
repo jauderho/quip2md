@@ -95,9 +95,9 @@ Measured on a personal account with 492 threads:
 
 - Full export: ~57 seconds, ~35 batched API requests, 29 images downloaded,
   zero failures.
-- Immediate re-run (nothing changed): ~35 seconds — every thread is
+- Immediate re-run (nothing changed): ~14 seconds — every thread is
   skipped-unchanged, but metadata is still fetched for all of them to
-  detect changes.
+  detect changes. Up to 3 batch requests run at once.
 
 The client self-throttles to 80% of the observed per-minute rate limit (50
 requests/minute per personal token) and adapts to the `X-RateLimit-*`
