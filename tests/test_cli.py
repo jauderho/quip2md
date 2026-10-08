@@ -502,7 +502,8 @@ class _FakeEnexRunner:
         return name
 
     def note_ids_in_folder(self, folder_id: str) -> list[str]:
-        return [n.note_id for n in self.notes_in_folder(folder_id)]
+        gone = {note_id for note_id, _ in self.moved}
+        return [n.note_id for n in self.notes_in_folder(folder_id) if n.note_id not in gone]
 
     def notes_in_folder(self, folder_id: str):
         del folder_id
@@ -512,8 +513,9 @@ class _FakeEnexRunner:
             ImportedNote("id-1", "Doc One", "<div>Source: <u>https://quip.com/AAA111</u></div>")
         ]
 
-    def move_note(self, note_id: str, folder_id: str) -> None:
-        self.moved.append((note_id, folder_id))
+    def move_notes(self, landing_id: str, moves: Sequence[tuple[str, str]]) -> dict[str, str]:
+        self.moved.extend(moves)
+        return {}
 
     def child_folder_id(self, parent_id: str, name: str) -> str:
         return f"{parent_id}/{name}"

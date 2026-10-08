@@ -94,13 +94,15 @@ class FakeEnexRunner:
         return f"folder:{name}"
 
     def note_ids_in_folder(self, folder_id: str) -> list[str]:
-        return [n.note_id for n in self.notes_in_folder(folder_id)]
+        gone = {note_id for note_id, _ in self.moved}
+        return [n.note_id for n in self.notes_in_folder(folder_id) if n.note_id not in gone]
 
     def notes_in_folder(self, folder_id: str) -> list[ImportedNote]:
         return list(self.landing_notes)
 
-    def move_note(self, note_id: str, folder_id: str) -> None:
-        self.moved.append((note_id, folder_id))
+    def move_notes(self, landing_id: str, moves: Sequence[tuple[str, str]]) -> dict[str, str]:
+        self.moved.extend(moves)
+        return {}
 
     def child_folder_id(self, parent_id: str, name: str) -> str:
         return f"{parent_id}/{name}"
@@ -421,10 +423,9 @@ def test_a_move_failure_is_isolated_to_its_own_note(tmp_path: Path) -> None:
     _write_doc(source, "B.md", quip_id="T2", url="https://quip.com/T2", title="B", body="b\n")
 
     class Failing(FakeEnexRunner):
-        def move_note(self, note_id: str, folder_id: str) -> None:
-            if note_id == "id-1":
-                raise RuntimeError("boom")
-            super().move_note(note_id, folder_id)
+        def move_notes(self, landing_id: str, moves: Sequence[tuple[str, str]]) -> dict[str, str]:
+            super().move_notes(landing_id, [m for m in moves if m[0] != "id-1"])
+            return {"id-1": "boom"} if any(m[0] == "id-1" for m in moves) else {}
 
     runner = Failing(
         landing_notes=[

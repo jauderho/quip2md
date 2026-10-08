@@ -127,6 +127,10 @@ _BODY_HEAD_CHARS = 1200
 _RECORD_SEPARATOR = "\x1e"
 _FIELD_SEPARATOR = "\x1f"
 
+#: Notes filed per osascript call: one launch per batch, yet small enough that an
+#: interrupted batch leaves little to reconcile and stays far under the call timeout.
+_MOVE_BATCH = 25
+
 #: Rendering is CPU-bound and per-document independent, so it is spread over a
 #: process pool. Below this many documents the pool costs more than it saves
 #: (spawning an interpreter per worker dominates), so the sequential path runs.
@@ -262,7 +266,7 @@ class EnexNotesRunnerProtocol(Protocol):
 
     def child_folder_id(self, parent_id: str, name: str) -> str: ...
 
-    def move_note(self, note_id: str, folder_id: str) -> None: ...
+    def move_notes(self, landing_id: str, moves: Sequence[tuple[str, str]]) -> dict[str, str]: ...
 
     def open_enex(self, path: Path) -> None: ...
 
@@ -391,13 +395,25 @@ on run argv
 end run
 """
 
-_AS_MOVE_NOTE = """
+_AS_MOVE_NOTES = """
 on run argv
-    set noteId to item 1 of argv
-    set folderId to item 2 of argv
+    set srcId to item 1 of argv
+    set failures to {}
     tell application "Notes"
-        move note id noteId to folder id folderId
+        set src to folder id srcId
+        repeat with k from 2 to (count of argv) by 2
+            set noteId to item k of argv
+            try
+                move (first note of src whose id is noteId) to folder id (item (k + 1) of argv)
+            on error errMsg
+                set end of failures to noteId & (ASCII character 31) & errMsg
+            end try
+        end repeat
     end tell
+    set AppleScript's text item delimiters to (ASCII character 30)
+    set out to failures as text
+    set AppleScript's text item delimiters to ""
+    return out
 end run
 """
 
@@ -545,8 +561,20 @@ class EnexNotesRunner:
             )
         return notes
 
-    def move_note(self, note_id: str, folder_id: str) -> None:
-        self._run(_AS_MOVE_NOTE, [note_id, folder_id])
+    def move_notes(self, landing_id: str, moves: Sequence[tuple[str, str]]) -> dict[str, str]:
+        """Move notes out of the landing folder in one call; returns `{note_id: error}`."""
+        if not moves:
+            return {}
+        argv = [landing_id]
+        for note_id, folder_id in moves:
+            argv += [note_id, folder_id]
+        failures: dict[str, str] = {}
+        for record in self._run(_AS_MOVE_NOTES, argv).split(_RECORD_SEPARATOR):
+            if not record.strip():
+                continue
+            note_id, _, reason = record.partition(_FIELD_SEPARATOR)
+            failures[note_id.strip()] = reason
+        return failures
 
     def open_enex(self, path: Path) -> None:
         """Hand a `.enex` file, or a folder of Markdown files, to Notes' importer."""
@@ -982,7 +1010,9 @@ def _import_batch(
             already_there=before.get(landing_name, frozenset()),
         )
     report.imported += len(imported)
-    _file_imported_notes(runner, account, imported, pending, state, report, markdown=markdown)
+    _file_imported_notes(
+        runner, account, landing_id, imported, pending, state, report, markdown=markdown
+    )
     return landing_name
 
 
@@ -1169,6 +1199,7 @@ def _await_landing_notes(
 def _file_imported_notes(
     runner: EnexNotesRunnerProtocol,
     account: str,
+    landing_id: str,
     imported: Sequence[ImportedNote],
     pending: Sequence[tuple[NoteSource, NoteEnml]],
     state: NotesState,
@@ -1179,6 +1210,7 @@ def _file_imported_notes(
     by_url = {source.quip_url: (source, note) for source, note in pending if source.quip_url}
     imported_at = _now_iso8601()
 
+    planned: list[tuple[ImportedNote, NoteSource, NoteEnml, str]] = []
     for note in imported:
         url = _extract_quip_url(note.body)
         match = by_url.get(url) if url else None
@@ -1186,35 +1218,75 @@ def _file_imported_notes(
             report.unmatched.append(note.name)
             continue
         source, enml = match
-
-        folder_path = source.folder_path
         try:
-            folder_id = runner.get_or_create_folder(account, folder_path)
-            runner.move_note(note.note_id, folder_id)
+            folder_id = runner.get_or_create_folder(account, source.folder_path)
         except Exception as exc:  # broad by design: per-note failure isolation
             report.failed.append((source.key, f"move failed: {_error_reason(exc)}"))
             continue
+        planned.append((note, source, enml, folder_id))
 
-        if _needs_indent_pass(source, enml, markdown=markdown):
-            report.indent_targets.append((note.note_id, source.title, enml.checklist))
-        previous = state.get(source.key)
-        superseded: tuple[str, ...] = ()
-        if previous is not None:
-            # The old note is kept, not deleted: this module never destroys
-            # anything in Notes. The run warns about the leftovers at the end.
-            superseded = (*previous.superseded_note_ids, previous.note_id)
-            report.superseded += 1
-        state.record(
-            source.key,
-            NoteStateEntry(
-                note_id=note.note_id,
-                folder="/".join(folder_path),
-                content_hash=_content_hash(source.title, enml.enml),
-                imported_at=imported_at,
-                superseded_note_ids=superseded,
-            ),
-        )
-        report.moved += 1
+    for start in range(0, len(planned), _MOVE_BATCH):
+        chunk = planned[start : start + _MOVE_BATCH]
+        try:
+            failures = runner.move_notes(
+                landing_id, [(note.note_id, folder_id) for note, _, _, folder_id in chunk]
+            )
+        except BaseException as exc:
+            # Unknown how far the call got. A note that left the landing folder
+            # was filed; recording it stops the next run importing it again.
+            try:
+                remaining = set(runner.note_ids_in_folder(landing_id))
+            except Exception:  # broad by design: never mask the original error
+                remaining = {note.note_id for note, _, _, _ in chunk}
+            for note, source, enml, folder_id in chunk:
+                if note.note_id not in remaining:
+                    _record_moved(
+                        note, source, enml, folder_id, state, report, imported_at, markdown
+                    )
+            if not isinstance(exc, Exception):
+                raise
+            for note, source, _, _ in chunk:
+                if note.note_id in remaining:
+                    report.failed.append((source.key, f"move failed: {_error_reason(exc)}"))
+            continue
+        for note, source, enml, folder_id in chunk:
+            if note.note_id in failures:
+                report.failed.append((source.key, f"move failed: {failures[note.note_id]}"))
+            else:
+                _record_moved(note, source, enml, folder_id, state, report, imported_at, markdown)
+
+
+def _record_moved(
+    note: ImportedNote,
+    source: NoteSource,
+    enml: NoteEnml,
+    folder_id: str,
+    state: NotesState,
+    report: EnexImportReport,
+    imported_at: str,
+    markdown: bool,
+) -> None:
+    """Record a note that now sits in its target folder."""
+    if _needs_indent_pass(source, enml, markdown=markdown):
+        report.indent_targets.append((note.note_id, source.title, enml.checklist))
+    previous = state.get(source.key)
+    superseded: tuple[str, ...] = ()
+    if previous is not None:
+        # The old note is kept, not deleted: this module never destroys
+        # anything in Notes. The run warns about the leftovers at the end.
+        superseded = (*previous.superseded_note_ids, previous.note_id)
+        report.superseded += 1
+    state.record(
+        source.key,
+        NoteStateEntry(
+            note_id=note.note_id,
+            folder="/".join(source.folder_path),
+            content_hash=_content_hash(source.title, enml.enml),
+            imported_at=imported_at,
+            superseded_note_ids=superseded,
+        ),
+    )
+    report.moved += 1
 
 
 def _extract_quip_url(body: str) -> str | None:

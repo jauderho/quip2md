@@ -36,7 +36,7 @@ from quip2md.notes_enex import (
     render_sources,
     run_enex_import,
 )
-from quip2md.notes_import import NotesError, NotesStateError, scan_source
+from quip2md.notes_import import NotesError, NoteSource, NotesState, NotesStateError, scan_source
 
 # --- Fixtures ---------------------------------------------------------------
 
@@ -103,14 +103,16 @@ class FakeEnexRunner:
         return f"folder:{name}"
 
     def note_ids_in_folder(self, folder_id: str) -> list[str]:
-        return [n.note_id for n in self.notes_in_folder(folder_id)]
+        gone = {note_id for note_id, _ in self.moved}
+        return [n.note_id for n in self.notes_in_folder(folder_id) if n.note_id not in gone]
 
     def notes_in_folder(self, folder_id: str) -> list[ImportedNote]:
         self.folder_reads += 1
         return list(self.landing_notes)
 
-    def move_note(self, note_id: str, folder_id: str) -> None:
-        self.moved.append((note_id, folder_id))
+    def move_notes(self, landing_id: str, moves: Sequence[tuple[str, str]]) -> dict[str, str]:
+        self.moved.extend(moves)
+        return {}
 
     def child_folder_id(self, parent_id: str, name: str) -> str:
         return f"{parent_id}/{name}"
@@ -632,10 +634,9 @@ def test_state_written_before_a_crash_survives_it(tmp_path: Path) -> None:
     _write_doc(source, "B.md", quip_id="THREAD0014", url="https://quip.com/THREAD0014", title="B")
 
     class CrashOnSecond(FakeEnexRunner):
-        def move_note(self, note_id: str, folder_id: str) -> None:
-            if note_id == "id-2":
-                raise KeyboardInterrupt
-            super().move_note(note_id, folder_id)
+        def move_notes(self, landing_id: str, moves: Sequence[tuple[str, str]]) -> dict[str, str]:
+            super().move_notes(landing_id, [m for m in moves if m[0] == "id-1"])
+            raise KeyboardInterrupt
 
     runner = CrashOnSecond(
         landing_notes=[
@@ -654,6 +655,110 @@ def test_state_written_before_a_crash_survives_it(tmp_path: Path) -> None:
         )
 
     assert set(_state(tmp_path)) == {"THREAD0013"}
+
+
+class _BatchRunner(FakeEnexRunner):
+    """Lets each `move_notes` call be scripted; the landing listing shrinks as notes move."""
+
+    def __init__(self, count: int) -> None:
+        super().__init__(
+            landing_notes=[
+                ImportedNote(f"id-{i}", f"N{i}", _provenance(_url(i))) for i in range(count)
+            ]
+        )
+        self.calls: list[list[str]] = []
+
+    def move_notes(self, landing_id: str, moves: Sequence[tuple[str, str]]) -> dict[str, str]:
+        self.calls.append([note_id for note_id, _ in moves])
+        return super().move_notes(landing_id, moves)
+
+
+def _url(i: int) -> str:
+    return f"https://quip.com/T{i}"
+
+
+def _file(
+    runner: FakeEnexRunner, count: int, tmp_path: Path
+) -> tuple[NotesState, EnexImportReport]:
+    pending = [
+        (
+            NoteSource(
+                key=f"T{i}",
+                md_path=tmp_path / f"{i}.md",
+                relative_path=f"{i}.md",
+                folder_path=("Quip",),
+                title=f"N{i}",
+                quip_url=_url(i),
+                body_markdown="",
+                keyed_by_path=False,
+            ),
+            NoteEnml(title=f"N{i}", enml=""),
+        )
+        for i in range(count)
+    ]
+    state = NotesState(tmp_path / "state.json")
+    report = EnexImportReport()
+    notes_enex._file_imported_notes(
+        runner, "iCloud", "landing", runner.landing_notes, pending, state, report
+    )
+    return state, report
+
+
+def test_notes_are_filed_in_batches_of_move_batch(tmp_path: Path) -> None:
+    runner = _BatchRunner(60)
+    _state, report = _file(runner, 60, tmp_path)
+
+    assert [len(call) for call in runner.calls] == [25, 25, 10]
+    assert [n for call in runner.calls for n in call] == [f"id-{i}" for i in range(60)]
+    assert report.moved == 60
+    assert report.failed == []
+
+
+def test_a_failed_move_notes_call_is_reconciled_and_the_next_chunk_runs(tmp_path: Path) -> None:
+    class Partial(_BatchRunner):
+        def move_notes(self, landing_id: str, moves: Sequence[tuple[str, str]]) -> dict[str, str]:
+            if not self.calls:
+                self.calls.append([n for n, _ in moves])
+                self.moved.extend(moves[:10])  # ten left the landing folder before the error
+                raise NotesError("timed out")
+            return super().move_notes(landing_id, moves)
+
+    runner = Partial(30)
+    state, report = _file(runner, 30, tmp_path)
+
+    assert report.moved == 10 + 5
+    assert [key for key, _ in report.failed] == [f"T{i}" for i in range(10, 25)]
+    assert all("move failed: " in reason for _, reason in report.failed)
+    assert all(state.get(f"T{i}") is not None for i in [*range(10), *range(25, 30)])
+    assert all(state.get(f"T{i}") is None for i in range(10, 25))
+    assert [len(call) for call in runner.calls] == [25, 5]
+
+
+def test_a_failing_reconcile_read_does_not_mask_the_move_error(tmp_path: Path) -> None:
+    class Broken(_BatchRunner):
+        def move_notes(self, landing_id: str, moves: Sequence[tuple[str, str]]) -> dict[str, str]:
+            raise NotesError("timed out")
+
+        def note_ids_in_folder(self, folder_id: str) -> list[str]:
+            raise NotesError("cannot list")
+
+    _state, report = _file(Broken(3), 3, tmp_path)
+
+    assert report.moved == 0
+    assert [key for key, _ in report.failed] == ["T0", "T1", "T2"]
+    assert all("timed out" in reason for _, reason in report.failed)
+
+
+def test_an_interrupt_with_a_failing_reconcile_read_still_propagates(tmp_path: Path) -> None:
+    class Broken(_BatchRunner):
+        def move_notes(self, landing_id: str, moves: Sequence[tuple[str, str]]) -> dict[str, str]:
+            raise KeyboardInterrupt
+
+        def note_ids_in_folder(self, folder_id: str) -> list[str]:
+            raise NotesError("cannot list")
+
+    with pytest.raises(KeyboardInterrupt):
+        _file(Broken(3), 3, tmp_path)
 
 
 def test_a_second_run_records_the_same_content_hash(tmp_path: Path) -> None:
@@ -1226,18 +1331,33 @@ def test_get_or_create_folder_caches_each_ancestor(
     assert seen[1][2] == "folder:Quip"
 
 
-def test_move_note_passes_both_ids_through_argv(
+def test_move_notes_passes_all_ids_through_argv_and_parses_failures(
+    scripted_runner: tuple[EnexNotesRunner, list[Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner, _replies = scripted_runner
+    seen: list[tuple[str, list[str]]] = []
+
+    def fake_run(self: EnexNotesRunner, script: str, argv: list[str]) -> str:
+        seen.append((script, list(argv)))
+        return "n2\x1fno such note\x1e\x1e"
+
+    monkeypatch.setattr(EnexNotesRunner, "_run", fake_run)
+    failures = runner.move_notes("land", [("n1", "f1"), ("n2", "f2")])
+    assert [argv for _, argv in seen] == [["land", "n1", "f1", "n2", "f2"]]
+    assert "n1" not in seen[0][0] and "land" not in seen[0][0]
+    assert failures == {"n2": "no such note"}
+
+
+def test_move_notes_with_nothing_to_move_makes_no_call(
     scripted_runner: tuple[EnexNotesRunner, list[Any]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runner, _replies = scripted_runner
     seen: list[list[str]] = []
     monkeypatch.setattr(
-        EnexNotesRunner,
-        "_run",
-        lambda self, script, argv: seen.append(list(argv)) or "",
+        EnexNotesRunner, "_run", lambda self, script, argv: seen.append(list(argv)) or ""
     )
-    runner.move_note("note-1", "folder-2")
-    assert seen == [["note-1", "folder-2"]]
+    assert runner.move_notes("land", []) == {}
+    assert seen == []
 
 
 # --- The `osascript` boundary ------------------------------------------------

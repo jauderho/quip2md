@@ -200,8 +200,9 @@ class TwoRouteRunner:
     def notes_in_folder(self, folder_id: str) -> list[ImportedNote]:
         return list(self.notes_by_open[len(self.opened) - 1])
 
-    def move_note(self, note_id: str, folder_id: str) -> None:
-        self.moved.append((note_id, folder_id))
+    def move_notes(self, landing_id: str, moves: Sequence[tuple[str, str]]) -> dict[str, str]:
+        self.moved.extend(moves)
+        return {}
 
     def open_enex(self, path: Path) -> None:
         self.opened.append(path)
