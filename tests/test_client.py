@@ -6,6 +6,7 @@ Uses `httpx.MockTransport` (no real network) and fake clock/sleep doubles
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from email.utils import formatdate
 from pathlib import Path
@@ -129,6 +130,38 @@ def test_hourly_budget_pacing() -> None:
 
     limiter.acquire()
     assert sleeper.calls == pytest.approx([720.0])
+
+
+def test_acquire_is_thread_safe_under_concurrent_callers() -> None:
+    clock = FakeClock()
+    sleeper = RecordingSleeper(clock)
+    limiter = RateLimiter(
+        per_minute_limit=10,
+        per_hour_limit=1_000_000,
+        throttle_fraction=0.5,
+        clock=clock,
+        sleep=sleeper,
+    )
+    workers, per_worker = 8, 5  # 40 acquires; capacity 5 tokens, 5/60 tokens/sec
+    barrier = threading.Barrier(workers)
+
+    def work() -> None:
+        barrier.wait()
+        for _ in range(per_worker):
+            limiter.acquire()
+
+    threads = [threading.Thread(target=work) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    total = workers * per_worker
+    # 5 burst tokens, then each further acquire waits exactly 12 s; with the
+    # lock held through the sleep, no acquire can overdraw the bucket.
+    assert len(sleeper.calls) == total - 5
+    assert sleeper.calls == pytest.approx([12.0] * (total - 5))
+    assert clock.now == pytest.approx(12.0 * (total - 5))
 
 
 # --- RateLimiter: header-driven pacing ---------------------------------

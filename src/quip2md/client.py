@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import random
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -319,6 +320,7 @@ class RateLimiter:
         self._minute_rate = self._minute_capacity / 60.0
         self._hour_rate = self._hour_capacity / 3600.0
         self._last_refill = self._clock()
+        self._lock = threading.Lock()
 
     def _refill(self) -> None:
         now = self._clock()
@@ -330,20 +332,25 @@ class RateLimiter:
         self._last_refill = now
 
     def acquire(self) -> None:
-        """Block (via the injected sleep) until a request may proceed."""
-        self._refill()
-        wait_for_minute = 0.0
-        if self._minute_tokens < 1.0:
-            wait_for_minute = (1.0 - self._minute_tokens) / self._minute_rate
-        wait_for_hour = 0.0
-        if self._hour_tokens < 1.0:
-            wait_for_hour = (1.0 - self._hour_tokens) / self._hour_rate
-        wait = max(wait_for_minute, wait_for_hour)
-        if wait > 0:
-            self._sleep(wait)
+        """Block (via the injected sleep) until a request may proceed.
+
+        Thread-safe: the lock is held through the sleep, so concurrent
+        callers are paced one at a time.
+        """
+        with self._lock:
             self._refill()
-        self._minute_tokens -= 1.0
-        self._hour_tokens -= 1.0
+            wait_for_minute = 0.0
+            if self._minute_tokens < 1.0:
+                wait_for_minute = (1.0 - self._minute_tokens) / self._minute_rate
+            wait_for_hour = 0.0
+            if self._hour_tokens < 1.0:
+                wait_for_hour = (1.0 - self._hour_tokens) / self._hour_rate
+            wait = max(wait_for_minute, wait_for_hour)
+            if wait > 0:
+                self._sleep(wait)
+                self._refill()
+            self._minute_tokens -= 1.0
+            self._hour_tokens -= 1.0
 
     def observe_headers(self, headers: Mapping[str, str]) -> None:
         """React to rate-limit headers from a response.

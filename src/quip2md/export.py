@@ -14,6 +14,10 @@ Design notes:
     chunk is sized at exactly `THREAD_BATCH_SIZE`, so `QuipClient
     .threads_batch()`'s own internal chunking never splits a chunk further;
     the two chunking layers use the same constant deliberately.
+  * Chunk fetches run ahead on up to `FETCH_WORKERS` threads (bounded
+    look-ahead), but chunks are processed strictly in order on the calling
+    thread. A fetch exception is captured per chunk and handed to
+    `_process_chunk`, so isolation is unchanged.
   * Filename collisions are resolved by `_NameAllocator`: within a single
     run, names claimed by an earlier thread in the same directory are
     tracked in memory; across runs, a name already present on disk is only
@@ -37,7 +41,9 @@ import json
 import logging
 import os
 import time
+from collections import deque
 from collections.abc import Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -55,6 +61,11 @@ logger = logging.getLogger("quip2md.export")
 # kept equal to the client's own batching constant deliberately (see module
 # docstring) rather than introducing a second, independently-tunable value.
 THREAD_BATCH_SIZE = _CLIENT_THREAD_BATCH_SIZE
+
+# Batch fetches in flight at once. One `threads_batch` request measured ~1 s,
+# so the export is latency-bound, not rate-limited; fetching ahead hides that
+# latency. The shared `RateLimiter` still paces the requests.
+FETCH_WORKERS = 3
 
 _EXT_BY_CONTENT_TYPE: dict[str, str] = {
     "image/png": ".png",
@@ -143,10 +154,25 @@ def run_export(
     manifest.load()
     allocator = _NameAllocator(config.output_dir, _load_path_owners(config.state_path))
 
+    chunks = [
+        work_items[start : start + THREAD_BATCH_SIZE]
+        for start in range(0, len(work_items), THREAD_BATCH_SIZE)
+    ]
+    executor = ThreadPoolExecutor(max_workers=FETCH_WORKERS, thread_name_prefix="quip2md-fetch")
+    pending: deque[Future[dict[str, ThreadContent]]] = deque()
+    next_chunk = 0
     try:
-        for chunk_start in range(0, len(work_items), THREAD_BATCH_SIZE):
-            chunk = work_items[chunk_start : chunk_start + THREAD_BATCH_SIZE]
-            _process_chunk(client, config, manifest, allocator, chunk, report)
+        for chunk in chunks:
+            while next_chunk < len(chunks) and len(pending) < FETCH_WORKERS:
+                chunk_ids = [item.thread_id for item in chunks[next_chunk]]
+                pending.append(executor.submit(client.threads_batch, chunk_ids))
+                next_chunk += 1
+            fetched: dict[str, ThreadContent] | Exception
+            try:
+                fetched = pending.popleft().result()
+            except Exception as exc:  # broad by design: batch-fetch isolation is the contract
+                fetched = exc
+            _process_chunk(client, config, manifest, allocator, chunk, fetched, report)
             # Flush after every batch (not just every `DEFAULT_FLUSH_EVERY`
             # records, and not just on the final `finally` below): this
             # shrinks the crash window in which `.md` files exist on disk
@@ -156,6 +182,7 @@ def run_export(
             # every batch rather than tuning `flush_every` down instead.
             manifest.flush()
     finally:
+        executor.shutdown(wait=False, cancel_futures=True)
         manifest.flush()
         report.elapsed_seconds = time.monotonic() - start_time
         _write_report_json(config, report)
@@ -169,20 +196,18 @@ def _process_chunk(
     manifest: Manifest,
     allocator: _NameAllocator,
     chunk: Sequence[ThreadWork],
+    fetched: Mapping[str, ThreadContent] | Exception,
     report: ExportReport,
 ) -> None:
-    chunk_ids = [item.thread_id for item in chunk]
-    try:
-        contents = client.threads_batch(chunk_ids)
-    except Exception as exc:  # broad by design: batch-fetch isolation is the contract
-        reason = f"batch fetch failed: {_error_reason(exc)}"
+    if isinstance(fetched, Exception):
+        reason = f"batch fetch failed: {_error_reason(fetched)}"
         for item in chunk:
             logger.error("thread %s failed: %s", item.thread_id, reason)
             report.failed.append((item.thread_id, reason))
         return
 
     for item in chunk:
-        content = contents.get(item.thread_id)
+        content = fetched.get(item.thread_id)
         if content is None:
             reason = "missing from threads_batch response"
             logger.error("thread %s failed: %s", item.thread_id, reason)

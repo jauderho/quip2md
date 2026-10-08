@@ -10,6 +10,8 @@ faked/sandboxed (`tmp_path`).
 from __future__ import annotations
 
 import json
+import threading
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
@@ -25,7 +27,7 @@ from quip2md.client import (
     ThreadType,
 )
 from quip2md.config import Config
-from quip2md.export import ExportReport, run_export
+from quip2md.export import FETCH_WORKERS, ExportReport, run_export
 
 # --- test helpers ------------------------------------------------------
 
@@ -52,6 +54,7 @@ class FakeExportClient:
         ) = None
         self.raise_on_threads_batch_call: int | None = None
         self._threads_batch_call_count = 0
+        self._count_lock = threading.Lock()
 
     def current_user(self) -> QuipUser:
         return self._user
@@ -61,8 +64,10 @@ class FakeExportClient:
 
     def threads_batch(self, ids: Sequence[str]) -> dict[str, ThreadContent]:
         self.threads_batch_calls.append(tuple(ids))
-        self._threads_batch_call_count += 1
-        if self._threads_batch_call_count == self.raise_on_threads_batch_call:
+        with self._count_lock:
+            self._threads_batch_call_count += 1
+            call_number = self._threads_batch_call_count
+        if call_number == self.raise_on_threads_batch_call:
             raise KeyboardInterrupt
         if self.threads_batch_side_effect is not None:
             return self.threads_batch_side_effect(ids)
@@ -576,3 +581,120 @@ def test_only_restricts_export_to_given_thread_ids(tmp_path: Path) -> None:
     assert report.exported == 1
     assert (config.output_dir / "Private" / "Two.md").is_file()
     assert not (config.output_dir / "Private" / "One.md").exists()
+
+
+# --- concurrent batch fetch ----------------------------------------------
+
+MULTI_CHUNK_THREADS = 40  # 3 chunks at THREAD_BATCH_SIZE == 15
+
+
+def _multi_chunk_contents() -> dict[str, ThreadContent]:
+    return {
+        f"T{i:03d}": make_content(f"T{i:03d}", f"Doc {i:03d}") for i in range(MULTI_CHUNK_THREADS)
+    }
+
+
+def _snapshot(tmp_path: Path, report: ExportReport) -> tuple[object, ...]:
+    export_dir = tmp_path / "export"
+    files = {
+        str(p.relative_to(export_dir)): "\n".join(
+            line
+            for line in p.read_text(encoding="utf-8").splitlines()
+            if not line.startswith("exported:")  # wall-clock timestamp
+        )
+        for p in sorted(export_dir.rglob("*.md"))
+    }
+    manifest = json.loads((tmp_path / ".quip2md" / "state.json").read_text(encoding="utf-8"))
+    return (
+        files,
+        {k: v["path"] for k, v in manifest.items()},
+        report.exported,
+        report.skipped_unchanged,
+        sorted(report.failed),
+    )
+
+
+def test_multi_chunk_output_independent_of_fetch_timing(tmp_path: Path) -> None:
+    contents = _multi_chunk_contents()
+    fast = simple_client(contents)
+    fast_report = run_export(fast, make_config(tmp_path / "fast"))
+
+    slow = simple_client(contents)
+    delays = {0: 0.03, 1: 0.01, 2: 0.0}
+
+    def slow_fetch(ids: Sequence[str]) -> dict[str, ThreadContent]:
+        time.sleep(delays[int(ids[0][1:]) // THREAD_BATCH_SIZE])
+        return {tid: contents[tid] for tid in ids}
+
+    slow.threads_batch_side_effect = slow_fetch
+    slow_report = run_export(slow, make_config(tmp_path / "slow"))
+
+    assert fast_report.exported == MULTI_CHUNK_THREADS
+    assert _snapshot(tmp_path / "fast", fast_report) == _snapshot(tmp_path / "slow", slow_report)
+
+
+def test_chunks_processed_in_order_when_fetches_finish_out_of_order(tmp_path: Path) -> None:
+    contents = _multi_chunk_contents()
+    client = simple_client(contents)
+    release_first = threading.Event()
+    later_done = threading.Barrier(3, timeout=5)
+
+    def side_effect(ids: Sequence[str]) -> dict[str, ThreadContent]:
+        if ids[0] == "T000":
+            # Finish only after the other two chunks have been fetched.
+            later_done.wait()
+            release_first.wait(timeout=5)
+        else:
+            later_done.wait()
+        return {tid: contents[tid] for tid in ids}
+
+    client.threads_batch_side_effect = side_effect
+    threading.Timer(0.02, release_first.set).start()
+    report = run_export(client, make_config(tmp_path))
+
+    assert report.exported == MULTI_CHUNK_THREADS
+    blob_order = [tid for tid, _ in client.blob_calls]
+    assert blob_order == sorted(blob_order)
+    manifest = json.loads((tmp_path / ".quip2md" / "state.json").read_text(encoding="utf-8"))
+    assert list(manifest) == sorted(manifest)
+
+
+def test_failing_fetch_fails_only_that_chunk(tmp_path: Path) -> None:
+    contents = _multi_chunk_contents()
+    client = simple_client(contents)
+
+    def side_effect(ids: Sequence[str]) -> dict[str, ThreadContent]:
+        if ids[0] == "T015":
+            raise RuntimeError("boom")
+        return {tid: contents[tid] for tid in ids}
+
+    client.threads_batch_side_effect = side_effect
+    report = run_export(client, make_config(tmp_path))
+
+    failed_ids = {tid for tid, _ in report.failed}
+    assert failed_ids == {f"T{i:03d}" for i in range(15, 30)}
+    assert all(reason.startswith("batch fetch failed: ") for _, reason in report.failed)
+    assert report.exported == MULTI_CHUNK_THREADS - 15
+
+
+def test_fetches_in_flight_never_exceed_fetch_workers(tmp_path: Path) -> None:
+    thread_count = THREAD_BATCH_SIZE * 12
+    contents = {f"T{i:03d}": make_content(f"T{i:03d}", f"Doc {i:03d}") for i in range(thread_count)}
+    client = simple_client(contents)
+    lock = threading.Lock()
+    state = {"current": 0, "peak": 0}
+
+    def side_effect(ids: Sequence[str]) -> dict[str, ThreadContent]:
+        with lock:
+            state["current"] += 1
+            state["peak"] = max(state["peak"], state["current"])
+        time.sleep(0.002)
+        with lock:
+            state["current"] -= 1
+        return {tid: contents[tid] for tid in ids}
+
+    client.threads_batch_side_effect = side_effect
+    report = run_export(client, make_config(tmp_path))
+
+    assert report.exported == thread_count
+    assert 1 <= state["peak"] <= FETCH_WORKERS
