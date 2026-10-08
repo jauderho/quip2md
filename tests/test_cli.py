@@ -501,6 +501,9 @@ class _FakeEnexRunner:
         del account
         return name
 
+    def note_ids_in_folder(self, folder_id: str) -> list[str]:
+        return [n.note_id for n in self.notes_in_folder(folder_id)]
+
     def notes_in_folder(self, folder_id: str):
         del folder_id
         from quip2md.notes_enex import ImportedNote

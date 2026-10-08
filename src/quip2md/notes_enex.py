@@ -118,13 +118,10 @@ _PROVENANCE_PREFIX = "Source:"
 _FIRST_INVOCATION_TIMEOUT_SECONDS = 120.0
 _SUBSEQUENT_INVOCATION_TIMEOUT_SECONDS = 60.0
 
-#: Notes are read back in batches of this many, each with its own timeout.
-#: One call for a whole corpus overran the timeout on a real 490-note run.
-_NOTE_READ_BATCH = 25
 _NOTE_READ_TIMEOUT_SECONDS = 300.0
 
 #: How much of each body to fetch. The provenance line is the first block;
-#: fetching whole bodies moves megabytes through osascript for no gain.
+#: whole bodies would only bloat stdout for no gain.
 _BODY_HEAD_CHARS = 1200
 
 _RECORD_SEPARATOR = "\x1e"
@@ -259,6 +256,8 @@ class EnexNotesRunnerProtocol(Protocol):
 
     def folder_id_by_name(self, account: str, name: str) -> str: ...
 
+    def note_ids_in_folder(self, folder_id: str) -> list[str]: ...
+
     def notes_in_folder(self, folder_id: str) -> list[ImportedNote]: ...
 
     def child_folder_id(self, parent_id: str, name: str) -> str: ...
@@ -345,40 +344,50 @@ on run argv
 end run
 """
 
-# Ids are snapshotted before any read so the collection is never mutated while
-# it is being walked (Notes errors out if it is).
+# One bulk read of the ids: far cheaper than walking the notes one by one.
 _AS_NOTE_IDS_IN_FOLDER = """
 on run argv
-    set folderId to item 1 of argv
     tell application "Notes"
-        set out to ""
-        repeat with n in notes of folder id folderId
-            set out to out & (id of n as string) & (ASCII character 30)
-        end repeat
-        return out
+        set ids to id of every note of folder id (item 1 of argv)
     end tell
+    set AppleScript's text item delimiters to (ASCII character 30)
+    set out to ids as text
+    set AppleScript's text item delimiters to ""
+    return out
 end run
 """
 
-# Only the head of each body is fetched. Matching needs the provenance line,
-# which `enex.py` puts in the first block, and a full-corpus read of 490 bodies
-# is megabytes of osascript stdout -- which is what made a real 492-note run
-# time out at the read-back step.
+# Bulk property reads cost ~0.05 ms per note; a `note id` lookup costs ~150 ms.
+# The three lists are separate Apple events, so the ids are re-read afterwards
+# and compared: if a note arrived in between, the lists could misalign and a
+# note would get another note's body. Bodies are cut to `headLen` here so
+# stdout stays small; matching only needs the provenance line at the top.
 _AS_NOTE_HEADS = """
 on run argv
-    set headLen to (item 1 of argv) as integer
-    tell application "Notes"
-        set out to ""
-        repeat with idx from 2 to (count of argv)
-            set i to item idx of argv
-            set n to note id i
-            set b to body of n
-            if (count of b) > headLen then set b to text 1 thru headLen of b
-            set out to out & i & (ASCII character 31) & (name of n) & ¬
-                (ASCII character 31) & b & (ASCII character 30)
-        end repeat
-        return out
-    end tell
+    set folderId to item 1 of argv
+    set headLen to (item 2 of argv) as integer
+    repeat 3 times
+        tell application "Notes"
+            set f to folder id folderId
+            set ids to id of every note of f
+            set nms to name of every note of f
+            set bds to body of every note of f
+            set idsAfter to id of every note of f
+        end tell
+        if ids is idsAfter then exit repeat
+    end repeat
+    if ids is not idsAfter then error "the folder changed while it was being read" number 1001
+    set recs to {}
+    repeat with k from 1 to count of ids
+        set b to item k of bds
+        if (count of b) > headLen then set b to text 1 thru headLen of b
+        set end of recs to (item k of ids) & (ASCII character 31) & ¬
+            (item k of nms) & (ASCII character 31) & b
+    end repeat
+    set AppleScript's text item delimiters to (ASCII character 30)
+    set out to recs as text
+    set AppleScript's text item delimiters to ""
+    return out & (ASCII character 30)
 end run
 """
 
@@ -501,39 +510,39 @@ class EnexNotesRunner:
             parent_id = folder_id
         return parent_id
 
-    def notes_in_folder(self, folder_id: str) -> list[ImportedNote]:
-        """Every note in the folder, read back in batches.
-
-        Ids first, then their heads in `_NOTE_READ_BATCH`-sized calls: a single
-        call covering a whole corpus overran the osascript timeout on a real
-        490-note import, which left every note unfiled.
-        """
-        ids = [
+    def note_ids_in_folder(self, folder_id: str) -> list[str]:
+        """Ids of every note in the folder, in one bulk read."""
+        return [
             part.strip()
             for part in self._run(_AS_NOTE_IDS_IN_FOLDER, [folder_id]).split(_RECORD_SEPARATOR)
             if part.strip()
         ]
+
+    def notes_in_folder(self, folder_id: str) -> list[ImportedNote]:
+        """Every note in the folder: id, name and the head of the body.
+
+        One call reads the whole folder with bulk property reads, which cost
+        far less per note than a `note id` lookup each (~150 ms apiece).
+        """
+        stdout = self._run(
+            _AS_NOTE_HEADS,
+            [folder_id, str(_BODY_HEAD_CHARS)],
+            timeout=_NOTE_READ_TIMEOUT_SECONDS,
+        )
         notes: list[ImportedNote] = []
-        for start in range(0, len(ids), _NOTE_READ_BATCH):
-            batch = ids[start : start + _NOTE_READ_BATCH]
-            stdout = self._run(
-                _AS_NOTE_HEADS,
-                [str(_BODY_HEAD_CHARS), *batch],
-                timeout=_NOTE_READ_TIMEOUT_SECONDS,
-            )
-            for record in stdout.split(_RECORD_SEPARATOR):
-                if not record.strip():
-                    continue
-                parts = record.split(_FIELD_SEPARATOR)
-                if len(parts) < 3:
-                    continue
-                notes.append(
-                    ImportedNote(
-                        note_id=parts[0].strip(),
-                        name=parts[1],
-                        body=_FIELD_SEPARATOR.join(parts[2:]),
-                    )
+        for record in stdout.split(_RECORD_SEPARATOR):
+            if not record.strip():
+                continue
+            parts = record.split(_FIELD_SEPARATOR)
+            if len(parts) < 3:
+                continue
+            notes.append(
+                ImportedNote(
+                    note_id=parts[0].strip(),
+                    name=parts[1],
+                    body=_FIELD_SEPARATOR.join(parts[2:]),
                 )
+            )
         return notes
 
     def move_note(self, note_id: str, folder_id: str) -> None:
@@ -1046,9 +1055,7 @@ def _select_pending(
 def _landing_snapshot(runner: EnexNotesRunnerProtocol, account: str) -> dict[str, frozenset[str]]:
     """Ids of the notes already in each landing folder, before an archive opens."""
     return {
-        name: frozenset(
-            note.note_id for note in runner.notes_in_folder(runner.folder_id_by_name(account, name))
-        )
+        name: frozenset(runner.note_ids_in_folder(runner.folder_id_by_name(account, name)))
         for name in runner.folder_names(account)
         if name.startswith(LANDING_FOLDER_PREFIX)
     }
@@ -1077,7 +1084,7 @@ def _await_landing_folder(
             if name not in names:
                 continue
             folder_id = runner.folder_id_by_name(account, name)
-            if any(note.note_id not in ids for note in runner.notes_in_folder(folder_id)):
+            if any(note_id not in ids for note_id in runner.note_ids_in_folder(folder_id)):
                 return name, folder_id
         time.sleep(IMPORT_POLL_INTERVAL_SECONDS)
     raise NotesError(
@@ -1122,7 +1129,9 @@ def _await_landing_notes(
     *,
     already_there: frozenset[str] = frozenset(),
 ) -> list[ImportedNote]:
-    """Poll the landing folder until it stops filling up.
+    """Poll the landing folder until it stops filling up, then read it once.
+
+    Polling reads ids only; the (slower) heads are read a single time at the end.
 
     `already_there` are ids the folder held before this import; they belong to
     someone else and are neither waited for nor returned.
@@ -1134,27 +1143,27 @@ def _await_landing_notes(
     count before returning.
     """
 
-    def arrived() -> list[ImportedNote]:
-        return [n for n in runner.notes_in_folder(landing_id) if n.note_id not in already_there]
+    def arrived() -> int:
+        return sum(1 for i in runner.note_ids_in_folder(landing_id) if i not in already_there)
 
-    notes = arrived()
+    count = arrived()
     previous = -1
-    while len(notes) != previous or len(notes) < expected:
+    while count != previous or count < expected:
         if time.monotonic() >= deadline:
             logger.warning(
                 "Notes stopped short: folder %r holds %d of the %d note(s) in the "
                 "archive after the wait expired. Proceeding with those; re-run to "
                 "import the remaining %d.",
                 landing_name,
-                len(notes),
+                count,
                 expected,
-                max(expected - len(notes), 0),
+                max(expected - count, 0),
             )
             break
-        previous = len(notes)
+        previous = count
         time.sleep(IMPORT_POLL_INTERVAL_SECONDS)
-        notes = arrived()
-    return notes
+        count = arrived()
+    return [n for n in runner.notes_in_folder(landing_id) if n.note_id not in already_there]
 
 
 def _file_imported_notes(

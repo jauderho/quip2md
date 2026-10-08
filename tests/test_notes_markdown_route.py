@@ -194,6 +194,9 @@ class TwoRouteRunner:
     def get_or_create_folder(self, account: str, path: Sequence[str]) -> str:
         return "folder:" + "/".join(path)
 
+    def note_ids_in_folder(self, folder_id: str) -> list[str]:
+        return [n.note_id for n in self.notes_in_folder(folder_id)]
+
     def notes_in_folder(self, folder_id: str) -> list[ImportedNote]:
         return list(self.notes_by_open[len(self.opened) - 1])
 
@@ -393,6 +396,9 @@ class MergingRunner(TwoRouteRunner):
 
     def folder_names(self, account: str) -> frozenset[str]:
         return frozenset({"Notes", "Imported Notes 1"})
+
+    def note_ids_in_folder(self, folder_id: str) -> list[str]:
+        return [n.note_id for n in self.notes_in_folder(folder_id)]
 
     def notes_in_folder(self, folder_id: str) -> list[ImportedNote]:
         arrived = self.notes_by_open[len(self.opened) - 1] if self.opened else []

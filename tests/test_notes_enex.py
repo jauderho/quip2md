@@ -93,6 +93,9 @@ class FakeEnexRunner:
     def folder_id_by_name(self, account: str, name: str) -> str:
         return f"folder:{name}"
 
+    def note_ids_in_folder(self, folder_id: str) -> list[str]:
+        return [n.note_id for n in self.notes_in_folder(folder_id)]
+
     def notes_in_folder(self, folder_id: str) -> list[ImportedNote]:
         return list(self.landing_notes)
 

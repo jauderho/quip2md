@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +28,7 @@ from quip2md import notes_enex
 from quip2md.config import Config
 from quip2md.enex import NoteEnml
 from quip2md.notes_enex import (
+    _BODY_HEAD_CHARS,
     EnexImportReport,
     EnexNotesRunner,
     ImportedNote,
@@ -99,6 +101,9 @@ class FakeEnexRunner:
 
     def folder_id_by_name(self, account: str, name: str) -> str:
         return f"folder:{name}"
+
+    def note_ids_in_folder(self, folder_id: str) -> list[str]:
+        return [n.note_id for n in self.notes_in_folder(folder_id)]
 
     def notes_in_folder(self, folder_id: str) -> list[ImportedNote]:
         self.folder_reads += 1
@@ -886,8 +891,9 @@ def test_the_landing_folder_is_polled_until_its_note_count_settles(tmp_path: Pat
 
     assert report.imported == 2
     assert report.moved == 2
-    # Three reads to see both notes, plus one confirming the count held steady.
-    assert runner.reads == 4
+    # Three polls to see both notes, one confirming the count held steady, and
+    # the single full read once polling is done.
+    assert runner.reads == 5
 
 
 def test_an_already_imported_note_is_still_offered_to_the_indent_pass(
@@ -1107,8 +1113,7 @@ def test_notes_in_folder_parses_records_and_keeps_separators_inside_bodies(
     scripted_runner: tuple[EnexNotesRunner, list[Any]],
 ) -> None:
     runner, replies = scripted_runner
-    # First reply is the id sweep, second the batched head read.
-    replies.append("id-1\x1eid-2\x1e")
+    # One bulk read returns every record.
     replies.append(
         "id-1\x1fA\x1f<div>body\x1fwith a separator</div>\x1e"
         "  \x1e"
@@ -1121,16 +1126,11 @@ def test_notes_in_folder_parses_records_and_keeps_separators_inside_bodies(
     ]
 
 
-def test_notes_in_folder_reads_heads_in_batches(
+def test_notes_in_folder_makes_one_osascript_call(
     scripted_runner: tuple[EnexNotesRunner, list[Any]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A whole corpus is never read in one osascript call.
-
-    A single call carrying 490 full bodies overran the osascript timeout on a
-    real import and left every note unfiled, so the ids are swept first and the
-    heads are fetched in bounded batches.
-    """
-    runner, replies = scripted_runner
+    """The whole folder is read in a single bulk call, not per note."""
+    runner, _replies = scripted_runner
     seen: list[list[str]] = []
 
     def recording_run(
@@ -1141,20 +1141,67 @@ def test_notes_in_folder_reads_heads_in_batches(
         timeout: float | None = None,
     ) -> str:
         seen.append(list(argv))
-        if len(seen) == 1:
-            return "".join(f"id-{n}\x1e" for n in range(60))
-        return "".join(f"{i}\x1fN\x1f<div>b</div>\x1e" for i in argv[1:])
+        return "".join(f"id-{n}\x1fN\x1f<div>b</div>\x1e" for n in range(60))
 
     monkeypatch.setattr(EnexNotesRunner, "_run", recording_run)
     notes = runner.notes_in_folder("folder:x")
 
     assert len(notes) == 60
-    head_calls = seen[1:]
-    assert len(head_calls) == 3, "60 notes must span more than one batch"
-    assert all(len(call) - 1 <= 25 for call in head_calls)
-    # Every id is fetched exactly once, in order.
-    fetched = [note_id for call in head_calls for note_id in call[1:]]
-    assert fetched == [f"id-{n}" for n in range(60)]
+    assert seen == [["folder:x", str(_BODY_HEAD_CHARS)]]
+
+
+def test_note_ids_in_folder_drops_blank_parts_and_strips(
+    scripted_runner: tuple[EnexNotesRunner, list[Any]],
+) -> None:
+    runner, replies = scripted_runner
+    replies.append(" id-1 \x1e\x1e   \x1eid-2\n\x1e")
+    assert runner.note_ids_in_folder("folder:x") == ["id-1", "id-2"]
+
+
+@dataclass
+class _CountingRunner(FakeEnexRunner):
+    id_reads: int = 0
+    head_reads: int = 0
+
+    def note_ids_in_folder(self, folder_id: str) -> list[str]:
+        self.id_reads += 1
+        return [n.note_id for n in self.landing_notes]
+
+    def notes_in_folder(self, folder_id: str) -> list[ImportedNote]:
+        self.head_reads += 1
+        return list(self.landing_notes)
+
+
+def test_await_landing_notes_polls_ids_and_reads_heads_once() -> None:
+    old = ImportedNote("old-1", "Old", "<div>older</div>")
+    new = ImportedNote("id-1", "New", "<div>new</div>")
+    runner = _CountingRunner(landing_notes=[old, new])
+
+    got = notes_enex._await_landing_notes(
+        runner,
+        "Imported Notes 1",
+        "folder:Imported Notes 1",
+        1,
+        time.monotonic() + 1000,
+        already_there=frozenset({"old-1"}),
+    )
+
+    assert got == [new]
+    assert runner.id_reads >= 2, "steady count needs two polls"
+    assert runner.head_reads == 1
+
+
+def test_landing_snapshot_reads_ids_only() -> None:
+    runner = _CountingRunner(
+        folders_before=frozenset({"Notes", "Imported Notes"}),
+        landing_notes=[ImportedNote("id-1", "A", "<div>a</div>")],
+    )
+
+    snapshot = notes_enex._landing_snapshot(runner, "iCloud")
+
+    assert snapshot == {"Imported Notes": frozenset({"id-1"})}
+    assert runner.head_reads == 0
+    assert runner.id_reads == 1
 
 
 def test_get_or_create_folder_caches_each_ancestor(
