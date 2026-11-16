@@ -7,6 +7,7 @@ Usage:
                     [--enex-file FILE] [--indent-checklists] [--local]
                     [--dryrun] [--verbose | -v] [--force] [--workers N]
                     [--only KEY [--only KEY ...]] [--no-fallback]
+                    [--auto-confirm]
 
 Switches (all under the `export` subcommand):
     --output DIR        Directory to write the exported Markdown tree into.
@@ -39,8 +40,9 @@ Switches (all under the `import-notes` subcommand):
                          Markdown importer: checklists arrive natively
                          nested, and each note keeps its Quip creation and
                          modification dates. Documents with images still go
-                         through an Evernote archive, which embeds them. Up
-                         to two clicks on Notes' confirmation sheet.
+                         through an Evernote archive, which embeds them.
+                         Notes asks for confirmation before it imports the
+                         Markdown folder (see `--auto-confirm`).
                          `enex` (the default elsewhere) imports everything
                          through one Evernote archive, which preserves
                          hyperlinks and checklists but flattens nested ones.
@@ -89,6 +91,12 @@ Switches (all under the `import-notes` subcommand):
                          minutes), do not quit Notes or re-route the
                          remaining documents through the archive; wait for
                          the full timeout and report them as failed instead.
+    --auto-confirm        Click the "Import" button on Notes' confirmation
+                         sheet automatically. Needs macOS Accessibility
+                         permission for the terminal running quip2md, checked
+                         before anything is imported; macOS English UI only.
+                         Does nothing with `--dryrun`. Rejected with
+                         `--writer applescript`, which shows no sheet.
 
 `import-notes` is a purely offline operation over `--source` and never reads
 `QUIP_TOKEN` or `.env`. On macOS, the *first* `import-notes` run in a while
@@ -104,7 +112,8 @@ Exit codes:
          prints) -- see the printed report and `.quip2md/last_run.json` /
          `.quip2md/last_notes_run.json` for details.
     2    a rejected flag combination (`--local` with `--writer enex`,
-         `--indent-checklists` with `--writer applescript`), or a
+         `--indent-checklists` or `--auto-confirm` with
+         `--writer applescript`), or a
          configuration, manifest, or Notes-state error (e.g. `QUIP_TOKEN`
          missing for `export`; a corrupted `.quip2md/state.json` or
          `.quip2md/notes_state.json`; an API error during the initial
@@ -329,6 +338,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "On a stalled Markdown import, do not quit Notes or re-route the "
             "remaining documents through the archive; report them as failed instead."
+        ),
+    )
+    notes_parser.add_argument(
+        "--auto-confirm",
+        action="store_true",
+        help=(
+            "Click Notes' 'Import' confirmation sheet automatically. Needs "
+            "Accessibility permission for the terminal running quip2md; macOS "
+            "English UI only. Not valid with --writer applescript."
         ),
     )
     notes_parser.add_argument(
@@ -568,6 +586,7 @@ def _main_import_notes_enex(args: argparse.Namespace, config: Config) -> int:
             adopt_landing=args.adopt_landing,
             markdown=args.writer == "markdown",
             fallback=not args.no_fallback,
+            auto_confirm=args.auto_confirm,
         )
     except KeyboardInterrupt:
         print(
@@ -703,6 +722,11 @@ def _reject_incompatible_writer_flags(
         parser.error(
             "--adopt-landing cannot be used with --writer applescript: only the "
             "enex writer imports through a landing folder."
+        )
+    if args.writer == "applescript" and args.auto_confirm:
+        parser.error(
+            "--auto-confirm cannot be used with --writer applescript: that "
+            "writer never shows Notes' Import sheet."
         )
 
 

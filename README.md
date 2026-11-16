@@ -140,6 +140,7 @@ All flags are under the `import-notes` subcommand.
 | `--adopt-landing FOLDER` | Resume an import whose notes reached Notes but were never filed, e.g. one that failed after you clicked Import. Imports nothing; files the notes already sitting in the named landing folder and records them in the state file. For a Markdown import, name the nested folder as `"Imported Notes/quip2md-markdown-<stamp>"`. Use this instead of re-running, which would import a second copy of every document. Rejected with `--writer applescript`. |
 | `--no-fallback` | On a stalled Markdown import (no new note for 3 minutes), do not quit Notes or re-route the remaining documents through the archive; the stalled import waits for the full 15-minute timeout and the documents still missing are reported as failed. By default the run quits and relaunches Notes and re-imports the remaining documents through an Evernote archive. |
 | `--workers N` | Number of processes used to render Markdown to ENML for the archive (`markdown` and `enex` writers). Defaults to the CPU count capped at 6 (measured optimum on a 4P+4E Apple Silicon machine; a homogeneous x86-64 box may benefit from more). `1` renders in-process. Output is byte-identical at any setting. |
+| `--auto-confirm` | Click the **Import** button on Notes' confirmation sheet automatically, so a Markdown import needs no one at the keyboard. Needs Accessibility permission (see below), checked before anything is imported; if it is missing the run stops with exit 2. macOS English UI only. Does nothing with `--dryrun`. Off by default; rejected with `--writer applescript`. |
 | `--indent-checklists` | After the import, drive the Notes editor to restore nested checklist levels in notes that came through the archive. Needs Accessibility permission (see below) and changes each touched note's modification date. Off by default; rejected with `--writer applescript`. |
 
 ### macOS requirement and permissions
@@ -153,16 +154,18 @@ VS Code…), not to `quip2md` itself.
 | Permission | Where | Needed for | Symptom if missing |
 |---|---|---|---|
 | **Automation → Notes** | System Settings → Privacy & Security → Automation → *your terminal* → Notes | Every import. Granted by clicking **OK** on the one-time "… wants to control Notes" prompt. | Import fails immediately; osascript reports "Not authorized to send Apple events". |
-| **Accessibility** | System Settings → Privacy & Security → **Accessibility** → add and enable *your terminal* | `--indent-checklists` only. That pass drives the Notes editor's Format menu, which is UI scripting. | The pass refuses to start and prints how to fix it. Import itself is unaffected. |
+| **Accessibility** | System Settings → Privacy & Security → **Accessibility** → add and enable *your terminal* | `--indent-checklists` and `--auto-confirm` only. Both are UI scripting: the first drives the Notes editor's Format menu, the second clicks Notes' Import sheet. | `--indent-checklists`: the pass refuses to start and prints how to fix it; the import itself is unaffected. `--auto-confirm`: the run stops before it imports anything (exit 2) and prints how to fix it. |
 
 The Accessibility grant is the one people miss, because the import works fine
 without it. There is no prompt for it in a non-interactive run — add the
-terminal to the list yourself, then re-run. If the terminal was already listed,
+terminal to the list yourself, restart the terminal, then re-run. If the terminal was already listed,
 toggle it off and on again after upgrading it, since the grant is tied to the
 binary.
 
-Notes' own **Import** sheet still has to be clicked by a human, once per run,
-whatever the permissions say. That is Notes' confirmation, not a permission.
+Notes asks for confirmation when it imports a Markdown folder (current Notes
+imports an archive without asking). Click **Import** on that sheet, or pass
+`--auto-confirm` to have quip2md click it. That is Notes' confirmation, not a
+permission.
 
 ### What lands in Notes
 
@@ -217,7 +220,8 @@ nested, so no indentation pass is needed. Two kinds of document stay on the
 with images (it never embeds an image, only links to it) and documents with a
 URL inside a table (it empties that cell and every cell after it). The whole
 staging folder (`.quip2md/quip2md-markdown-<UTC timestamp>`, replaced on the
-next run) imports with one confirmation, and the archive with a second. Notes
+next run) imports after one confirmation (click **Import**, or pass
+`--auto-confirm`); current Notes imports the archive without asking. Notes
 places the staging folder inside an `Imported Notes` folder; the run finds it
 there by its unique name, files its notes under `Quip`, and leaves the empty
 folders behind (see [Cleaning up after an import](#cleaning-up-after-an-import)).
@@ -226,8 +230,8 @@ item into its own item, so such an item arrives as several checkboxes; no text
 is lost.
 
 **`enex`** renders every document that has changed since the last run
-into one Evernote archive and hands it to Notes' own importer. Notes shows a
-single confirmation sheet — click **Import** — then fills an `Imported Notes`
+into one Evernote archive and hands it to Notes' own importer. Notes (after a
+single confirmation sheet on versions that ask — click **Import**) fills an `Imported Notes`
 folder (a fresh numbered one on older Notes; Notes 4.13 adds to an existing
 one, so the run looks for notes that were not there before), which the run
 polls until its note count stops growing. Each note is then matched back to its source by the Quip URL on its
@@ -392,5 +396,5 @@ rather than claiming a deletion that undid itself.
 |---|---|
 | `0` | Success, nothing failed. |
 | `1` | One or more threads failed to export, or one or more notes failed to import or could not be matched back to a source (the `markdown` and `enex` writers leave those in their landing folder, whose name the report prints). See the printed report and `.quip2md/last_run.json` / `.quip2md/last_notes_run.json`. |
-| `2` | A rejected flag combination (`--local` with `--writer markdown` or `enex`, `--indent-checklists` or `--adopt-landing` with `--writer applescript`, `--writer markdown` on Notes older than 4.13), or a configuration, manifest, or Notes-state error: missing `QUIP_TOKEN` (export), a corrupted `state.json`/`notes_state.json`, an API error during the initial folder walk, or, for `import-notes`, a non-macOS platform or a missing "On My Mac" account. A clear message is printed to stderr, no traceback. |
+| `2` | A rejected flag combination (`--local` with `--writer markdown` or `enex`, `--indent-checklists`, `--adopt-landing` or `--auto-confirm` with `--writer applescript`, `--writer markdown` on Notes older than 4.13), or a configuration, manifest, or Notes-state error: missing `QUIP_TOKEN` (export), a corrupted `state.json`/`notes_state.json`, an API error during the initial folder walk, or, for `import-notes`, a non-macOS platform or a missing "On My Mac" account. A clear message is printed to stderr, no traceback. |
 | `130` | Interrupted (Ctrl-C). The manifest/state file was already flushed; re-run the same command to resume. |

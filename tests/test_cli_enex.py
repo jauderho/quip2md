@@ -69,6 +69,8 @@ class _FakeEnexRunner:
         self.moved: list[tuple[str, str]] = []
         self.landing_notes: list[ImportedNote] = []
         self.restarts = 0
+        self.ui_checks = 0
+        self.confirmed: list[Path] = []
         self._opened_yet = False
 
     def resolve_account(self, *, local: bool) -> str:
@@ -104,6 +106,13 @@ class _FakeEnexRunner:
 
     def restart_notes(self) -> None:
         self.restarts += 1
+
+    def check_ui_scripting(self) -> None:
+        self.ui_checks += 1
+
+    def confirm_import(self, wait_seconds: float) -> bool:
+        self.confirmed.append(self.opened[-1])
+        return True
 
 
 def _matching_runner(*pairs: tuple[str, str]) -> _FakeEnexRunner:
@@ -584,6 +593,80 @@ def test_indent_checklists_with_the_applescript_writer_is_rejected(
         cli.main(["import-notes", "--writer", "applescript", "--indent-checklists"])
     assert excinfo.value.code == 2
     assert "--indent-checklists cannot be used with --writer applescript" in capsys.readouterr().err
+
+
+def test_auto_confirm_with_the_applescript_writer_is_rejected(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["import-notes", "--writer", "applescript", "--auto-confirm"])
+    assert excinfo.value.code == 2
+    assert "--auto-confirm cannot be used with --writer applescript" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("flags", "expected"), [(["--auto-confirm"], True), ([], False)])
+def test_auto_confirm_is_passed_to_the_import(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, flags: list[str], expected: bool
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    seen: list[bool] = []
+
+    def fake_run(runner: object, config: object, **kwargs: Any) -> EnexImportReport:
+        seen.append(kwargs["auto_confirm"])
+        return EnexImportReport()
+
+    monkeypatch.setattr(cli, "EnexNotesRunner", _FakeEnexRunner)
+    monkeypatch.setattr(cli, "run_enex_import", fake_run)
+
+    assert cli.main(["import-notes", "--writer", "enex", *flags]) == 0
+    assert seen == [expected]
+
+
+def test_auto_confirm_clicks_through_an_import_end_to_end(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_source_doc(tmp_path / "export", "Doc One.md", quip_id="THREAD0013", title="Doc One")
+    runner = _matching_runner(("THREAD0013", "Doc One"))
+    monkeypatch.setattr(cli, "EnexNotesRunner", lambda: runner)
+
+    assert cli.main(["import-notes", "--writer", "enex", "--auto-confirm"]) == 0
+
+    assert runner.ui_checks == 1
+    assert runner.confirmed == runner.opened and len(runner.opened) == 1
+
+
+def test_auto_confirm_without_accessibility_returns_exit_code_2(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_source_doc(tmp_path / "export", "Doc One.md", quip_id="THREAD0013", title="Doc One")
+
+    class NotTrusted(_FakeEnexRunner):
+        def check_ui_scripting(self) -> None:
+            raise NotesError(notes_enex.UI_SCRIPTING_HELP)
+
+    runner = NotTrusted()
+    monkeypatch.setattr(cli, "EnexNotesRunner", lambda: runner)
+
+    assert cli.main(["import-notes", "--writer", "enex", "--auto-confirm"]) == 2
+
+    assert runner.opened == []
+    assert "Privacy & Security > Accessibility" in capsys.readouterr().err
+
+
+def test_auto_confirm_is_accepted_with_dryrun_and_scripts_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write_source_doc(tmp_path / "export", "Doc One.md", quip_id="THREAD0013", title="Doc One")
+
+    def no_runner() -> _FakeEnexRunner:
+        raise AssertionError("a dry run builds no Notes runner")
+
+    monkeypatch.setattr(cli, "EnexNotesRunner", no_runner)
+
+    assert cli.main(["import-notes", "--writer", "enex", "--dryrun", "--auto-confirm"]) == 0
 
 
 def test_a_missing_subcommand_is_rejected_by_the_parser() -> None:

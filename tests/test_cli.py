@@ -524,6 +524,12 @@ class _FakeEnexRunner:
         self.opened.append(path)
         self._imported = True
 
+    def check_ui_scripting(self) -> None:
+        raise AssertionError("--auto-confirm is not passed here")
+
+    def confirm_import(self, wait_seconds: float) -> bool:
+        raise AssertionError("--auto-confirm is not passed here")
+
 
 def test_import_notes_enex_writer_is_the_default(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]

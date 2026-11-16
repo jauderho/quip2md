@@ -71,6 +71,7 @@ from quip2md.notes_import import (
     notes_run_lock,
     scan_source,
 )
+from quip2md.notes_indent import _AS_CHECK_ACCESSIBILITY, _TCC_ACCESSIBILITY_ERRORS
 from quip2md.walker import sanitize_component
 
 logger = logging.getLogger("quip2md.notes_enex")
@@ -125,6 +126,23 @@ _QUIP_URL_RE = re.compile(r"https?://(?:[\w.-]*\.)?quip\.com/[\w-]+", re.IGNOREC
 _BLOCK_BOUNDARY_RE = re.compile(r"</?(?:div|p|li|br|h[1-6])[^>]*>", re.IGNORECASE)
 _TAG_RE = re.compile(r"<[^>]+>")
 _PROVENANCE_PREFIX = "Source:"
+
+#: `--auto-confirm`: how long to wait for Notes' confirmation sheet after a
+#: file is opened. An archive never shows one on current Notes, so the wait
+#: ending without a sheet is normal.
+AUTO_CONFIRM_WAIT_SECONDS = 30.0
+_CONFIRM_POLL_INTERVAL_SECONDS = 0.5
+_CONFIRM_PROBE_TIMEOUT_SECONDS = 10.0
+
+#: What System Events says when the running binary lacks Accessibility access.
+_UI_SCRIPTING_DENIED = (*_TCC_ACCESSIBILITY_ERRORS, "-25211", "assistive access")
+
+UI_SCRIPTING_HELP = (
+    "--auto-confirm needs macOS Accessibility permission. Add the application "
+    "running quip2md (your terminal) under System Settings > Privacy & Security "
+    "> Accessibility, restart the terminal, then run the command again. "
+    "Nothing was imported."
+)
 
 _FIRST_INVOCATION_TIMEOUT_SECONDS = 120.0
 _SUBSEQUENT_INVOCATION_TIMEOUT_SECONDS = 60.0
@@ -298,6 +316,10 @@ class EnexNotesRunnerProtocol(Protocol):
 
     def restart_notes(self) -> None: ...
 
+    def check_ui_scripting(self) -> None: ...
+
+    def confirm_import(self, wait_seconds: float) -> bool: ...
+
 
 _AS_LIST_ACCOUNTS = """
 on run argv
@@ -308,6 +330,35 @@ end run
 """
 
 _AS_QUIT_NOTES = 'tell application "Notes" to quit'
+
+# Clicks "Import" on Notes' confirmation sheet, and on nothing else: the sheet
+# must carry the exact prompt *and* a button with that exact title. The
+# comparisons run here, under `considering case`, rather than in a `whose`
+# clause, which System Events matches without regard to case. English UI only.
+_AS_CONFIRM_IMPORT = """
+on run argv
+    tell application "System Events"
+        tell process "Notes"
+            repeat with w in windows
+                repeat with s in sheets of w
+                    set promptTexts to value of static texts of s
+                    considering case
+                        if promptTexts contains "Import to Notes?" then
+                            repeat with b in buttons of s
+                                if (title of b) is "Import" then
+                                    click (contents of b)
+                                    return "confirmed"
+                                end if
+                            end repeat
+                        end if
+                    end considering
+                end repeat
+            end repeat
+        end tell
+    end tell
+    return "none"
+end run
+"""
 
 _AS_FOLDER_NAMES = """
 on run argv
@@ -614,6 +665,39 @@ class EnexNotesRunner:
         if proc.returncode != 0:
             raise NotesError(f"could not hand {path.name} to Notes", stderr=proc.stderr.strip())
 
+    def check_ui_scripting(self) -> None:
+        """Raise unless this process may drive the UI (Accessibility permission)."""
+        try:
+            answer = self._run(_AS_CHECK_ACCESSIBILITY, []).strip().lower()
+        except NotesError as exc:
+            if _ui_scripting_denied(exc):
+                raise NotesError(UI_SCRIPTING_HELP, stderr=exc.stderr) from exc
+            raise
+        if answer != "true":
+            raise NotesError(UI_SCRIPTING_HELP)
+
+    def confirm_import(self, wait_seconds: float) -> bool:
+        """Click "Import" on Notes' confirmation sheet; False if none appears in time.
+
+        A failed probe counts as "not yet" (Notes may still be launching, or
+        the sheet still animating in), except a refused Accessibility
+        permission, which no amount of waiting fixes.
+        """
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            try:
+                answer = self._run(_AS_CONFIRM_IMPORT, [], timeout=_CONFIRM_PROBE_TIMEOUT_SECONDS)
+            except NotesError as exc:
+                if _ui_scripting_denied(exc):
+                    raise NotesError(UI_SCRIPTING_HELP, stderr=exc.stderr) from exc
+                logger.debug("confirmation probe failed: %s", _error_reason(exc))
+            else:
+                if answer.strip() == "confirmed":
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_CONFIRM_POLL_INTERVAL_SECONDS)
+
     def restart_notes(self) -> None:
         """Quit Notes -- by force if it must be -- and relaunch it.
 
@@ -686,6 +770,17 @@ class EnexNotesRunner:
                 os.kill(pid, signum)
             except ProcessLookupError:
                 continue  # it exited between the listing and the signal
+
+
+def _ui_scripting_denied(exc: NotesError) -> bool:
+    """Whether an osascript failure is a refused Accessibility permission.
+
+    "Invalid index" shares error -1719 with the refusal but only means the
+    window or sheet was not there (yet).
+    """
+    if "Invalid index" in exc.stderr:
+        return False
+    return any(marker in exc.stderr for marker in _UI_SCRIPTING_DENIED)
 
 
 # --- Markdown route ------------------------------------------------------
@@ -905,6 +1000,7 @@ def run_enex_import(
     markdown: bool = False,
     stall_seconds: float = IMPORT_STALL_SECONDS,
     fallback: bool = True,
+    auto_confirm: bool = False,
 ) -> EnexImportReport:
     """Render `source_dir` to a single `.enex` and import it into Notes.
 
@@ -920,8 +1016,17 @@ def run_enex_import(
     from needing a working Notes automation permission at all.
 
     `confirm` exists so the caller can suppress the "click Import" prompt in a
-    non-interactive context; the sheet still has to be clicked by a human
-    either way, which is why the wait is generous and its timeout explicit.
+    non-interactive context; without `auto_confirm` the sheet still has to be
+    clicked by a human, which is why the wait is generous and its timeout
+    explicit. Notes shows the sheet for a Markdown folder; current Notes
+    imports an archive without asking.
+
+    With `auto_confirm`, the run clicks the sheet's "Import" button itself
+    (`runner.confirm_import()`) after each file it opens. That is UI
+    scripting, so `runner.check_ui_scripting()` must pass before anything is
+    opened; it raises `NotesError` when the Accessibility permission is
+    missing. It does nothing in a dry run or with `adopt_landing`, which open
+    nothing.
 
     With `fallback`, a Markdown import whose landing folder gains no note for
     `stall_seconds` has stalled, and the run recovers on its own instead of
@@ -1000,6 +1105,9 @@ def run_enex_import(
 
     if runner is None:
         raise NotesError("a Notes runner is required for a real (non-dry-run) import")
+    auto_confirm = auto_confirm and adopt_landing is None
+    if auto_confirm:
+        runner.check_ui_scripting()
 
     with notes_run_lock(config.state_path.parent):
         batches: list[tuple[Path, str | None, list[tuple[NoteSource, NoteEnml]]]] = []
@@ -1022,6 +1130,7 @@ def run_enex_import(
             adopt_landing=adopt_landing,
             stall_seconds=stall_seconds,
             fallback_path=(config.state_path.parent / FALLBACK_ENEX_FILENAME if fallback else None),
+            auto_confirm=auto_confirm,
         )
 
 
@@ -1038,6 +1147,7 @@ def _import_into_notes(
     adopt_landing: str | None,
     stall_seconds: float = IMPORT_STALL_SECONDS,
     fallback_path: Path | None = None,
+    auto_confirm: bool = False,
 ) -> EnexImportReport:
     """Hand each batch to Notes and file what comes back. Holds the run lock.
 
@@ -1071,6 +1181,7 @@ def _import_into_notes(
                     timeout_seconds=timeout_seconds,
                     stall_seconds=stall_seconds,
                     fallback_path=fallback_path,
+                    auto_confirm=auto_confirm,
                 )
             )
     finally:
@@ -1104,6 +1215,7 @@ def _import_batch(
     timeout_seconds: float = IMPORT_TIMEOUT_SECONDS,
     stall_seconds: float = IMPORT_STALL_SECONDS,
     fallback_path: Path | None = None,
+    auto_confirm: bool = False,
 ) -> str:
     """Import one archive or Markdown folder and file its notes; returns the landing name."""
     if adopt_landing is not None:
@@ -1118,7 +1230,12 @@ def _import_batch(
         logger.warning("Adopting the notes already in %r; nothing will be imported.", adopt_landing)
     else:
         before = _landing_snapshot(runner, account) if child is None else {}
-        if confirm:
+        if auto_confirm:
+            logger.info(
+                "If Notes asks to confirm the import of %s, it is confirmed automatically.",
+                target.name,
+            )
+        elif confirm:
             logger.warning(
                 "Notes will now ask you to confirm the import of %s. Click 'Import' "
                 "in the dialog; this run waits up to %.0f minutes.",
@@ -1126,6 +1243,11 @@ def _import_batch(
                 max(deadline - time.monotonic(), 0) / 60,
             )
         runner.open_enex(target)
+        if auto_confirm:
+            if runner.confirm_import(AUTO_CONFIRM_WAIT_SECONDS):
+                logger.info("Confirmed the import of %s.", target.name)
+            else:
+                logger.info("Notes showed no confirmation sheet for %s.", target.name)
         if child is None:
             landing_name, landing_id = _await_landing_folder(runner, account, before, deadline)
         else:
@@ -1175,6 +1297,7 @@ def _import_batch(
                 confirm=confirm,
                 timeout_seconds=timeout_seconds,
                 stall_seconds=stall_seconds,
+                auto_confirm=auto_confirm,
             )
         _fail_undelivered(report, landing_name, missing)
     return landing_name
@@ -1206,6 +1329,7 @@ def _reroute_through_archive(
     confirm: bool,
     timeout_seconds: float,
     stall_seconds: float,
+    auto_confirm: bool = False,
 ) -> str:
     """Recover a stalled Markdown import; returns the landing folder name(s).
 
@@ -1258,6 +1382,7 @@ def _reroute_through_archive(
         adopt_landing=None,
         timeout_seconds=timeout_seconds,
         stall_seconds=stall_seconds,
+        auto_confirm=auto_confirm,
     )
     return f"{landing_name}, {fallback_landing}"
 

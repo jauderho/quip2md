@@ -177,6 +177,8 @@ class TwoRouteRunner:
     moved: list[tuple[str, str]] = field(default_factory=list)
     child_lookups: list[tuple[str, str]] = field(default_factory=list)
     restarts: int = 0
+    ui_checks: int = 0
+    confirmed: list[Path] = field(default_factory=list)
 
     def resolve_account(self, *, local: bool) -> str:
         return "iCloud"
@@ -210,6 +212,13 @@ class TwoRouteRunner:
 
     def restart_notes(self) -> None:
         self.restarts += 1
+
+    def check_ui_scripting(self) -> None:
+        self.ui_checks += 1
+
+    def confirm_import(self, wait_seconds: float) -> bool:
+        self.confirmed.append(self.opened[-1])
+        return True
 
 
 @pytest.fixture(autouse=True)

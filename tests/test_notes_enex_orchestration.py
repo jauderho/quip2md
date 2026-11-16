@@ -86,6 +86,11 @@ class FakeEnexRunner:
     folder_name_calls: int = 0
     folder_reads: int = 0
     restarts: int = 0
+    ui_trusted: bool = True
+    #: How many files had been opened at each Accessibility check.
+    ui_checks: list[int] = field(default_factory=list)
+    #: The file last opened at each `confirm_import()` call.
+    confirmed: list[Path] = field(default_factory=list)
     _opened_yet: bool = False
 
     def resolve_account(self, *, local: bool) -> str:
@@ -125,6 +130,15 @@ class FakeEnexRunner:
 
     def restart_notes(self) -> None:
         self.restarts += 1
+
+    def check_ui_scripting(self) -> None:
+        self.ui_checks.append(len(self.opened))
+        if not self.ui_trusted:
+            raise NotesError("Accessibility permission is missing")
+
+    def confirm_import(self, wait_seconds: float) -> bool:
+        self.confirmed.append(self.opened[-1])
+        return True
 
 
 @pytest.fixture(autouse=True)
@@ -332,6 +346,118 @@ def test_confirm_true_logs_the_click_instruction(
             confirm=True,
         )
     assert "Click 'Import'" in caplog.text
+
+
+# --- `auto_confirm` -----------------------------------------------------------
+
+
+def test_auto_confirm_checks_accessibility_first_then_confirms_each_opened_file(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    source = tmp_path / "export"
+    _write_doc(source, "A.md", quip_id="THREAD0013", url="https://quip.com/THREAD0013", title="A")
+    runner = FakeEnexRunner(
+        landing_notes=[ImportedNote("n-1", "A", _provenance("https://quip.com/THREAD0013"))]
+    )
+    target = tmp_path / "o.enex"
+
+    with caplog.at_level("INFO", logger="quip2md.notes_enex"):
+        report = run_enex_import(
+            runner, _config(tmp_path), source_dir=source, enex_path=target, auto_confirm=True
+        )
+
+    assert runner.ui_checks == [0], "checked once, before anything was opened"
+    assert runner.opened == [target]
+    assert runner.confirmed == [target], "confirmed once, after the file was opened"
+    assert report.moved == 1
+    assert "Click 'Import'" not in caplog.text
+    assert "confirmed automatically" in caplog.text
+    assert "Confirmed the import of o.enex" in caplog.text
+
+
+def test_auto_confirm_logs_when_notes_shows_no_sheet(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    source = tmp_path / "export"
+    _write_doc(source, "A.md", quip_id="THREAD0013", url="https://quip.com/THREAD0013", title="A")
+
+    class NeverAsks(FakeEnexRunner):
+        def confirm_import(self, wait_seconds: float) -> bool:
+            assert wait_seconds == notes_enex.AUTO_CONFIRM_WAIT_SECONDS
+            return False
+
+    with caplog.at_level("INFO", logger="quip2md.notes_enex"):
+        run_enex_import(
+            NeverAsks(
+                landing_notes=[ImportedNote("n-1", "A", _provenance("https://quip.com/THREAD0013"))]
+            ),
+            _config(tmp_path),
+            source_dir=source,
+            enex_path=tmp_path / "o.enex",
+            auto_confirm=True,
+        )
+    assert "showed no confirmation sheet for o.enex" in caplog.text
+
+
+def test_auto_confirm_without_accessibility_opens_nothing(tmp_path: Path) -> None:
+    source = tmp_path / "export"
+    _write_doc(source, "A.md", quip_id="THREAD0013", url="https://quip.com/THREAD0013", title="A")
+    runner = FakeEnexRunner(ui_trusted=False)
+
+    with pytest.raises(NotesError, match="Accessibility"):
+        run_enex_import(
+            runner,
+            _config(tmp_path),
+            source_dir=source,
+            enex_path=tmp_path / "o.enex",
+            auto_confirm=True,
+        )
+
+    assert runner.opened == []
+    assert runner.confirmed == []
+    assert runner.folder_name_calls == 0, "Notes was not touched at all"
+    assert not (tmp_path / ".quip2md" / "notes_state.json").exists()
+
+
+def test_without_auto_confirm_the_ui_is_never_scripted(tmp_path: Path) -> None:
+    source = tmp_path / "export"
+    _write_doc(source, "A.md", quip_id="THREAD0013", url="https://quip.com/THREAD0013", title="A")
+    runner = FakeEnexRunner(ui_trusted=False)
+
+    run_enex_import(runner, _config(tmp_path), source_dir=source, enex_path=tmp_path / "o.enex")
+
+    assert len(runner.opened) == 1
+    assert runner.ui_checks == []
+    assert runner.confirmed == []
+
+
+def test_auto_confirm_does_nothing_in_a_dry_run(tmp_path: Path) -> None:
+    source = tmp_path / "export"
+    _write_doc(source, "A.md", quip_id="THREAD0013", url="https://quip.com/THREAD0013", title="A")
+
+    report = run_enex_import(
+        None, _config(tmp_path, dry_run=True), source_dir=source, auto_confirm=True
+    )
+
+    assert report.documents == 1
+
+
+def test_auto_confirm_does_nothing_when_adopting_a_landing_folder(tmp_path: Path) -> None:
+    source = tmp_path / "export"
+    _write_doc(source, "A.md", quip_id="THREAD0013", url="https://quip.com/THREAD0013", title="A")
+    runner = FakeEnexRunner(ui_trusted=False)
+
+    run_enex_import(
+        runner,
+        _config(tmp_path),
+        source_dir=source,
+        adopt_landing="Imported Notes 1",
+        auto_confirm=True,
+    )
+
+    assert runner.opened == []
+    assert runner.ui_checks == []
+    assert runner.confirmed == []
 
 
 # --- Matching ---------------------------------------------------------------
@@ -1285,6 +1411,25 @@ def _fallback_archive(tmp_path: Path) -> Path:
     return tmp_path / ".quip2md" / "quip2md-fallback.enex"
 
 
+def test_auto_confirm_also_confirms_the_fallback_archive(tmp_path: Path) -> None:
+    source = _three_markdown_docs(tmp_path)
+    runner = StallingRunner(
+        markdown_notes=[_imported("md-a", 13)],
+        archive_notes=[_imported("enex-b", 14), _imported("enex-c", 15)],
+    )
+
+    report = run_enex_import(
+        runner, _config(tmp_path), source_dir=source, markdown=True, auto_confirm=True
+    )
+
+    assert runner.ui_checks == [0]
+    assert [path.name for path in runner.opened] == [
+        Path(report.markdown_path).name,
+        "quip2md-fallback.enex",
+    ]
+    assert runner.confirmed == runner.opened
+
+
 def test_a_stalled_markdown_import_reroutes_the_rest_through_the_archive(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1911,6 +2056,124 @@ def test_a_failed_open_is_reported_rather_than_leaving_the_run_waiting(
     _stub_subprocess(monkeypatch, returncode=1, stderr="Unable to find application")
     with pytest.raises(NotesError, match="could not hand quip2md.enex to Notes"):
         EnexNotesRunner().open_enex(tmp_path / "quip2md.enex")
+
+
+# --- UI scripting: the Accessibility check and the Import sheet ---------------
+
+_NOT_TRUSTED = "System Events got an error: osascript is not allowed assistive access. (-25211)"
+
+
+def _scripted_osascript(
+    monkeypatch: pytest.MonkeyPatch, answers: Sequence[FakeCompletedProcess]
+) -> list[list[str]]:
+    """Answer each `osascript` call in turn, repeating the last answer for ever."""
+    seen: list[list[str]] = []
+
+    def fake_run(command: Sequence[str], *args: Any, **kwargs: Any) -> FakeCompletedProcess:
+        assert kwargs.get("check") is False and "shell" not in kwargs
+        seen.append(list(command))
+        return answers[min(len(seen), len(answers)) - 1]
+
+    monkeypatch.setattr(notes_enex.subprocess, "run", fake_run)
+    return seen
+
+
+def test_check_ui_scripting_passes_when_the_process_is_trusted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _stub_subprocess(monkeypatch, stdout="true\n")
+    EnexNotesRunner().check_ui_scripting()
+    assert "UI elements enabled" in seen[0][2]
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr"),
+    [(0, "false\n", ""), (1, "", _NOT_TRUSTED)],
+)
+def test_check_ui_scripting_names_the_fix_when_the_process_is_not_trusted(
+    monkeypatch: pytest.MonkeyPatch, returncode: int, stdout: str, stderr: str
+) -> None:
+    _stub_subprocess(monkeypatch, returncode=returncode, stdout=stdout, stderr=stderr)
+    with pytest.raises(NotesError, match="Privacy & Security > Accessibility, restart"):
+        EnexNotesRunner().check_ui_scripting()
+
+
+def test_check_ui_scripting_does_not_blame_accessibility_for_another_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_subprocess(monkeypatch, returncode=1, stderr="Connection is invalid. (-609)")
+    with pytest.raises(NotesError) as excinfo:
+        EnexNotesRunner().check_ui_scripting()
+    assert "Accessibility" not in str(excinfo.value)
+
+
+def test_confirm_import_clicks_the_sheet_and_returns_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = _stub_subprocess(monkeypatch, stdout="confirmed\n")
+
+    assert EnexNotesRunner().confirm_import(30.0) is True
+
+    assert len(seen) == 1
+    assert seen[0][:2] == ["osascript", "-e"] and seen[0][3:] == ["--"]
+    assert seen[0][2] == notes_enex._AS_CONFIRM_IMPORT
+
+
+def test_the_confirm_script_only_clicks_import_on_the_import_sheet() -> None:
+    """Both conditions, compared exactly: a refactor must not loosen them."""
+    script = notes_enex._AS_CONFIRM_IMPORT
+    assert 'if promptTexts contains "Import to Notes?" then' in script
+    assert 'if (title of b) is "Import" then' in script
+    assert "considering case" in script
+    assert script.count("click") == 1
+    assert script.index('contains "Import to Notes?"') < script.index('is "Import"')
+    assert script.index('is "Import"') < script.index("click")
+    assert "sheets of w" in script and "whose" not in script
+
+
+def test_confirm_import_returns_false_when_no_sheet_appears(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _stub_subprocess(monkeypatch, stdout="none\n")
+
+    assert EnexNotesRunner().confirm_import(2.0) is False
+
+    # One probe per poll interval until the wait ends, then one last look.
+    assert len(seen) == int(2.0 / notes_enex._CONFIRM_POLL_INTERVAL_SECONDS) + 1
+    assert time.monotonic() == 2.0
+
+
+def test_confirm_import_raises_when_accessibility_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _stub_subprocess(monkeypatch, returncode=1, stderr=_NOT_TRUSTED)
+
+    with pytest.raises(NotesError, match="Accessibility"):
+        EnexNotesRunner().confirm_import(30.0)
+    assert len(seen) == 1, "a refused permission is not retried"
+
+
+def test_confirm_import_retries_a_transient_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = _scripted_osascript(
+        monkeypatch,
+        [
+            # Notes still launching; then a window that went away mid-read,
+            # which shares error -1719 with the Accessibility refusal.
+            FakeCompletedProcess(1, stderr='Can\u2019t get process "Notes". (-1728)'),
+            FakeCompletedProcess(1, stderr="Can\u2019t get window 1. Invalid index. (-1719)"),
+            FakeCompletedProcess(0, stdout="none\n"),
+            FakeCompletedProcess(0, stdout="confirmed\n"),
+        ],
+    )
+
+    assert EnexNotesRunner().confirm_import(30.0) is True
+    assert len(seen) == 4
+
+
+def test_confirm_import_treats_a_hung_probe_as_not_yet(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = _stub_subprocess(
+        monkeypatch, raises=subprocess.TimeoutExpired(cmd="osascript", timeout=10.0)
+    )
+    assert EnexNotesRunner().confirm_import(1.0) is False
+    assert len(seen) == 3
 
 
 # --- Restarting Notes ---------------------------------------------------------

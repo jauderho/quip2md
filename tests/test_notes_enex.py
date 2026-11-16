@@ -77,6 +77,8 @@ class FakeEnexRunner:
     moved: list[tuple[str, str]] = field(default_factory=list)
     created_folders: list[tuple[str, ...]] = field(default_factory=list)
     restarts: int = 0
+    ui_checks: int = 0
+    confirmed: list[Path] = field(default_factory=list)
     _opened_yet: bool = False
 
     def resolve_account(self, *, local: bool) -> str:
@@ -114,6 +116,13 @@ class FakeEnexRunner:
 
     def restart_notes(self) -> None:
         self.restarts += 1
+
+    def check_ui_scripting(self) -> None:
+        self.ui_checks += 1
+
+    def confirm_import(self, wait_seconds: float) -> bool:
+        self.confirmed.append(self.opened[-1])
+        return True
 
 
 @pytest.fixture(autouse=True)
