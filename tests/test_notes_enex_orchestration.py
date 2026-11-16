@@ -1132,7 +1132,7 @@ def test_adopting_a_folder_that_does_not_exist_is_an_error(tmp_path: Path) -> No
         )
 
 
-def test_a_landing_folder_that_stays_short_proceeds_with_a_warning(
+def test_a_landing_folder_that_stays_short_files_what_came_and_fails_the_rest(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     source = tmp_path / "export"
@@ -1156,6 +1156,9 @@ def test_a_landing_folder_that_stays_short_proceeds_with_a_warning(
     assert report.moved == 1
     assert "holds 1 of the 2 note(s)" in caplog.text
     assert "Imported Notes 1" in caplog.text
+    # The note Notes never delivered is a failure of the run, so the CLI exits 1.
+    assert [key for key, _ in report.failed] == ["THREAD0014"]
+    assert "never arrived" in report.failed[0][1]
 
 
 # --- EnexNotesRunner --------------------------------------------------------

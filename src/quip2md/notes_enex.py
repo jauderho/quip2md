@@ -1013,6 +1013,19 @@ def _import_batch(
     _file_imported_notes(
         runner, account, landing_id, imported, pending, state, report, markdown=markdown
     )
+    if adopt_landing is None:
+        # A source Notes never delivered (the wait expired) is not in Notes at
+        # all, so the run must not report success over it.
+        arrived = {_extract_quip_url(note.body) for note in imported}
+        for source, _note in pending:
+            if source.quip_url not in arrived:
+                report.failed.append(
+                    (
+                        source.key,
+                        f"never arrived in {landing_name!r} before the wait expired; "
+                        "re-run to import it",
+                    )
+                )
     return landing_name
 
 

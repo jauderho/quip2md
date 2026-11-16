@@ -233,8 +233,10 @@ polls until its note count stops growing. Each note is then matched back to its 
 `Source:` provenance line (only that line counts, so a link to another exported
 document cannot mis-file a note) and moved into its mirrored folder under
 `Quip`. Notes it cannot match are left there and listed in the report, and the
-run exits with status 1 so they are not mistaken for a clean import. This
-writer preserves:
+run exits with status 1 so they are not mistaken for a clean import. If
+Notes stalls and the 15-minute wait expires, the run files the notes that
+arrived, lists every document that did not under `failed`, and exits with
+status 1. This writer preserves:
 
 - clickable hyperlinks, including the link back to the original Quip document;
 - native checklists, with checked and unchecked state;
