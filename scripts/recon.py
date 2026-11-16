@@ -526,9 +526,7 @@ def probe_thread_content(
 
             page_count = 1
             while next_cursor:
-                page_resp = recon.get(
-                    f"/2/threads/{probe_id}/html", params={"cursor": next_cursor}
-                )
+                page_resp = recon.get(f"/2/threads/{probe_id}/html", params={"cursor": next_cursor})
                 if page_resp is None or not page_resp.is_success:
                     status = page_resp.status_code if page_resp is not None else "n/a"
                     report.add(
@@ -706,8 +704,11 @@ def probe_blob(
             )
             if response.is_success:
                 return thread_id, html
-    report.add(section, "No `<img>` tag pointing at a `/blob/` or `/-/blob/` path was found "
-               "in the thread HTML fetched so far; blob download not exercised.")
+    report.add(
+        section,
+        "No `<img>` tag pointing at a `/blob/` or `/-/blob/` path was found "
+        "in the thread HTML fetched so far; blob download not exercised.",
+    )
     return None, None
 
 
@@ -946,9 +947,7 @@ def main() -> None:
 
         if user is not None:
             folder_ids, thread_ids = probe_folders(recon, report, user)
-            probe_doc_id, _sample_html, html_by_id = probe_thread_content(
-                recon, report, thread_ids
-            )
+            probe_doc_id, _sample_html, html_by_id = probe_thread_content(recon, report, thread_ids)
 
             _type_counts, _max_depth, type_by_id = probe_census(
                 recon, report, folder_ids, thread_ids

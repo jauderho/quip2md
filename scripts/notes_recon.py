@@ -68,8 +68,7 @@ TCC_DENIED_CODE: Final[str] = "-1743"
 
 # A real, small image from the export tree (read-only probe input).
 SAMPLE_IMAGE: Final[Path] = (
-    ROOT / "export" / "Private" / "Work" / "_assets" / "GPRAAAoQfLS"
-    / "dGrHsJc2zBYxf22iesKy1w.png"
+    ROOT / "export" / "Private" / "Work" / "_assets" / "GPRAAAoQfLS" / "dGrHsJc2zBYxf22iesKy1w.png"
 )
 
 VERBOSE: Final[bool] = "--verbose" in sys.argv or "-v" in sys.argv
@@ -148,9 +147,7 @@ class Recon:
                     "responded in time. Not retried; see report for what remains "
                     "NOT VERIFIED."
                 )
-            return OsaResult(
-                ok=False, stdout="", stderr="timeout", returncode=-1, timed_out=True
-            )
+            return OsaResult(ok=False, stdout="", stderr="timeout", returncode=-1, timed_out=True)
 
         elapsed_ms = (time.monotonic() - start) * 1000
         self.invocation_count += 1
@@ -167,8 +164,7 @@ class Recon:
             )
         self.invocation_log.append(
             f"{self.invocation_count}. {probe_name}: exit={proc.returncode} "
-            f"({elapsed_ms:.0f}ms)"
-            + (f" DENIED({TCC_DENIED_CODE})" if denied else "")
+            f"({elapsed_ms:.0f}ms)" + (f" DENIED({TCC_DENIED_CODE})" if denied else "")
         )
         log(
             f"osascript[{probe_name}] -> exit={proc.returncode} "
@@ -234,8 +230,7 @@ class Report:
                 lines.extend(body)
             else:
                 lines.append(
-                    "NOT VERIFIED — this probe was not reached (see permission/budget "
-                    "notes above)."
+                    "NOT VERIFIED — this probe was not reached (see permission/budget notes above)."
                 )
             lines.append("")
             lines.append("---")
@@ -517,7 +512,7 @@ def probe_account(recon: Recon, report: Report) -> bool:
     local_present = "On My Mac" in acc_names
     report.add(
         section,
-        "An \"On My Mac\" (local) account is "
+        'An "On My Mac" (local) account is '
         + ("present" if local_present else "NOT present")
         + " in the accounts list on this machine (report only — Notes settings unchanged).",
     )
@@ -534,9 +529,7 @@ def probe_folders(recon: Recon, report: Report) -> str | None:
     children plus a duplicate-name sibling. Returns the top folder's id."""
     section = "2. Folder creation (top-level, nested, duplicate-name)"
 
-    result = recon.run_applescript(
-        "create_top_folder", AS_CREATE_TOP_FOLDER, [RECON_FOLDER]
-    )
+    result = recon.run_applescript("create_top_folder", AS_CREATE_TOP_FOLDER, [RECON_FOLDER])
     if not result.ok:
         report.add(
             section,
@@ -574,9 +567,7 @@ def probe_folders(recon: Recon, report: Report) -> str | None:
     )
 
     # Duplicate-name folder at top level.
-    result = recon.run_applescript(
-        "create_duplicate_folder", AS_CREATE_TOP_FOLDER, [RECON_FOLDER]
-    )
+    result = recon.run_applescript("create_duplicate_folder", AS_CREATE_TOP_FOLDER, [RECON_FOLDER])
     if result.ok:
         dup_id = result.stdout.strip()
         report.add(
@@ -680,9 +671,7 @@ def probe_image(recon: Recon, report: Report, top_folder_id: str) -> None:
     )
     if result.ok:
         note_id = result.stdout.strip()
-        body_result = recon.run_applescript(
-            "get_attachment_note_body", AS_GET_NOTE_BODY, [note_id]
-        )
+        body_result = recon.run_applescript("get_attachment_note_body", AS_GET_NOTE_BODY, [note_id])
         body_snippet = body_result.stdout.strip()[:2000] if body_result.ok else "(read failed)"
         report.add(
             section,
@@ -711,7 +700,7 @@ def probe_image(recon: Recon, report: Report, top_folder_id: str) -> None:
 
     # (b) <img src="file://..."> in the body HTML.
     file_uri = SAMPLE_IMAGE.as_uri()
-    img_html = f"<div>img-src-probe</div><img src=\"{file_uri}\" />"
+    img_html = f'<div>img-src-probe</div><img src="{file_uri}" />'
     result = recon.run_applescript(
         "create_note_with_img_src", AS_CREATE_NOTE_HTML, [top_folder_id, img_html]
     )
@@ -722,7 +711,7 @@ def probe_image(recon: Recon, report: Report, top_folder_id: str) -> None:
         body_snippet = body_result.stdout.strip()[:2000] if body_result.ok else "(read failed)"
         report.add(
             section,
-            f"(b) `<img src=\"file://...\">` in body HTML: note creation SUCCEEDED. "
+            f'(b) `<img src="file://...">` in body HTML: note creation SUCCEEDED. '
             f"Note id: `{note_id}`.",
         )
         report.add(section, "")
@@ -740,7 +729,7 @@ def probe_image(recon: Recon, report: Report, top_folder_id: str) -> None:
     else:
         report.add(
             section,
-            f"(b) `<img src=\"file://...\">` in body HTML: note creation FAILED "
+            f'(b) `<img src="file://...">` in body HTML: note creation FAILED '
             f"(exit {result.returncode}). stderr: `{result.stderr.strip()}`",
         )
 
