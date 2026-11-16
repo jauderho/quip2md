@@ -66,9 +66,11 @@ DEFAULT_TIMEOUT: Final[float] = 30.0
 FIRST_INVOCATION_TIMEOUT: Final[float] = 120.0
 TCC_DENIED_CODE: Final[str] = "-1743"
 
-# A real, small image from the export tree (read-only probe input).
-SAMPLE_IMAGE: Final[Path] = (
-    ROOT / "export" / "Private" / "Work" / "_assets" / "GPRAAAoQfLS" / "dGrHsJc2zBYxf22iesKy1w.png"
+# A real image from the export tree (read-only probe input). Found at run time
+# so no account-specific id is in the source; a missing one is reported.
+SAMPLE_IMAGE: Final[Path] = next(
+    iter(sorted((ROOT / "export").glob("**/_assets/*/*.png"))),
+    ROOT / "export" / "_assets" / "none.png",
 )
 
 VERBOSE: Final[bool] = "--verbose" in sys.argv or "-v" in sys.argv
