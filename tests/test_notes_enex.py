@@ -76,6 +76,7 @@ class FakeEnexRunner:
     opened: list[Path] = field(default_factory=list)
     moved: list[tuple[str, str]] = field(default_factory=list)
     created_folders: list[tuple[str, ...]] = field(default_factory=list)
+    restarts: int = 0
     _opened_yet: bool = False
 
     def resolve_account(self, *, local: bool) -> str:
@@ -110,6 +111,9 @@ class FakeEnexRunner:
     def open_enex(self, path: Path) -> None:
         self.opened.append(path)
         self._opened_yet = True
+
+    def restart_notes(self) -> None:
+        self.restarts += 1
 
 
 @pytest.fixture(autouse=True)

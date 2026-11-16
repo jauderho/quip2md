@@ -15,6 +15,7 @@ executed. `tests/conftest.py`'s guard stays armed throughout.
 from __future__ import annotations
 
 import json
+import signal
 import subprocess
 import time
 from collections.abc import Sequence
@@ -84,6 +85,7 @@ class FakeEnexRunner:
     created_folders: list[tuple[str, ...]] = field(default_factory=list)
     folder_name_calls: int = 0
     folder_reads: int = 0
+    restarts: int = 0
     _opened_yet: bool = False
 
     def resolve_account(self, *, local: bool) -> str:
@@ -120,6 +122,9 @@ class FakeEnexRunner:
     def open_enex(self, path: Path) -> None:
         self.opened.append(path)
         self._opened_yet = True
+
+    def restart_notes(self) -> None:
+        self.restarts += 1
 
 
 @pytest.fixture(autouse=True)
@@ -1161,6 +1166,419 @@ def test_a_landing_folder_that_stays_short_files_what_came_and_fails_the_rest(
     assert "never arrived" in report.failed[0][1]
 
 
+# --- A stalled import ---------------------------------------------------------
+
+
+def test_a_folder_that_stops_growing_ends_the_wait_long_before_the_deadline(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runner = _CountingRunner(landing_notes=[ImportedNote("id-1", "A", "<div>a</div>")])
+
+    with caplog.at_level("WARNING", logger="quip2md.notes_enex"):
+        got = notes_enex._await_landing_notes(
+            runner, "Imported Notes 1", "folder:x", 3, 900.0, stall_seconds=30.0
+        )
+
+    assert [note.note_id for note in got] == ["id-1"]
+    assert time.monotonic() == 30.0
+    assert "stopped delivering" in caplog.text
+    assert "'Imported Notes 1' holds 1 of the 3 note(s)" in caplog.text
+    assert "gained none in 30 seconds" in caplog.text
+
+
+def test_every_new_note_restarts_the_stall_clock() -> None:
+    """A slow import is not a stalled one: only the time since the last note counts."""
+    notes = [ImportedNote(f"id-{i}", "N", "<div>n</div>") for i in range(3)]
+
+    class OneEveryEightPolls(FakeEnexRunner):
+        polls: int = 0
+
+        def note_ids_in_folder(self, folder_id: str) -> list[str]:
+            self.polls += 1
+            return [note.note_id for note in notes[: self.polls // 8]]
+
+        def notes_in_folder(self, folder_id: str) -> list[ImportedNote]:
+            return list(notes)
+
+    # A note every 24 s against a 30 s stall limit: 72 s in all, never stalled.
+    got = notes_enex._await_landing_notes(
+        OneEveryEightPolls(), "Imported Notes 1", "folder:x", 3, 900.0, stall_seconds=30.0
+    )
+
+    assert len(got) == 3
+    assert time.monotonic() > 60.0
+
+
+def test_without_a_stall_limit_only_the_deadline_ends_the_wait(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runner = _CountingRunner(landing_notes=[ImportedNote("id-1", "A", "<div>a</div>")])
+    with caplog.at_level("WARNING", logger="quip2md.notes_enex"):
+        notes_enex._await_landing_notes(runner, "L", "folder:x", 3, 900.0)
+    assert time.monotonic() == 900.0
+    assert "Notes stopped short" in caplog.text
+    assert "stopped delivering" not in caplog.text
+
+
+def test_the_deadline_still_ends_a_wait_that_has_not_stalled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runner = _CountingRunner()
+    with caplog.at_level("WARNING", logger="quip2md.notes_enex"):
+        notes_enex._await_landing_notes(runner, "L", "folder:x", 1, 12.0, stall_seconds=30.0)
+    assert time.monotonic() == 12.0
+    assert "after the wait expired" in caplog.text
+    assert "stopped delivering" not in caplog.text
+
+
+_NESTED = "- [ ] a\n    - [x] b\n"
+_ARCHIVE_LANDING = "folder:Imported Notes"
+
+
+@dataclass
+class StallingRunner(FakeEnexRunner):
+    """Notes 4.13 with a Markdown importer that hangs part-way through.
+
+    The Markdown folder nests inside the existing "Imported Notes" folder and
+    only ever receives `markdown_notes` (plus `late_notes` once Notes has been
+    restarted). An archive adds `archive_notes` to "Imported Notes" itself.
+    """
+
+    folders_before: frozenset[str] = frozenset({"Notes", "Imported Notes"})
+    landing_name: str = "Imported Notes"
+    markdown_notes: list[ImportedNote] = field(default_factory=list)
+    late_notes: list[ImportedNote] = field(default_factory=list)
+    archive_notes: list[ImportedNote] = field(default_factory=list)
+    #: Restarts so far at each open: proves the restart came before the archive.
+    opened_after_restarts: list[int] = field(default_factory=list)
+
+    def notes_in_folder(self, folder_id: str) -> list[ImportedNote]:
+        if folder_id == _ARCHIVE_LANDING:
+            archive_opened = any(path.suffix == ".enex" for path in self.opened)
+            return list(self.archive_notes) if archive_opened else []
+        return [*self.markdown_notes, *(self.late_notes if self.restarts else [])]
+
+    def open_enex(self, path: Path) -> None:
+        super().open_enex(path)
+        self.opened_after_restarts.append(self.restarts)
+
+
+def _three_markdown_docs(tmp_path: Path) -> Path:
+    source = tmp_path / "export"
+    for number, title in ((13, "A"), (14, "B"), (15, "C")):
+        _write_doc(
+            source,
+            f"{title}.md",
+            quip_id=f"THREAD00{number}",
+            url=_url(number),
+            title=title,
+            body=_NESTED,
+        )
+    return source
+
+
+def _imported(note_id: str, number: int) -> ImportedNote:
+    return ImportedNote(note_id, note_id, _provenance(_url(number)))
+
+
+def _fallback_archive(tmp_path: Path) -> Path:
+    return tmp_path / ".quip2md" / "quip2md-fallback.enex"
+
+
+def test_a_stalled_markdown_import_reroutes_the_rest_through_the_archive(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    source = _three_markdown_docs(tmp_path)
+    runner = StallingRunner(
+        markdown_notes=[_imported("md-a", 13)],
+        archive_notes=[_imported("enex-b", 14), _imported("enex-c", 15)],
+    )
+
+    with caplog.at_level("WARNING", logger="quip2md.notes_enex"):
+        report = run_enex_import(runner, _config(tmp_path), source_dir=source, markdown=True)
+
+    assert runner.restarts == 1
+    fallback = _fallback_archive(tmp_path)
+    assert [path.name for path in runner.opened] == [
+        Path(report.markdown_path).name,
+        "quip2md-fallback.enex",
+    ]
+    assert runner.opened_after_restarts == [0, 1], "Notes is restarted before the archive opens"
+    archive = fallback.read_text(encoding="utf-8")
+    assert _url(13) not in archive, "a note that arrived must not be imported twice"
+    assert _url(14) in archive and _url(15) in archive
+    assert sorted(runner.moved) == [
+        ("enex-b", "folder:Quip"),
+        ("enex-c", "folder:Quip"),
+        ("md-a", "folder:Quip"),
+    ]
+    assert report.imported == 3
+    assert report.moved == 3
+    assert report.rerouted == 2
+    assert report.failed == []
+    assert report.unmatched == []
+    assert report.enex_path == "", "the fallback archive is not the run's archive"
+    assert report.landing_folder == (
+        f"Imported Notes/{Path(report.markdown_path).name}, Imported Notes"
+    )
+    # The archive flattened B and C; the Markdown importer nested A natively.
+    assert sorted(target[0] for target in report.indent_targets) == ["enex-b", "enex-c"]
+    assert set(_state(tmp_path)) == {"THREAD0013", "THREAD0014", "THREAD0015"}
+    assert "Notes stalled" in caplog.text
+    assert "the 2 remaining document(s) through the archive" in caplog.text
+    # Cut off after 3 minutes without a note, not after the 15-minute timeout.
+    assert "stopped delivering" in caplog.text
+    assert "Notes stopped short" not in caplog.text
+    assert report.elapsed_seconds < 300.0
+
+
+def test_the_fallback_archive_gets_a_fresh_deadline(tmp_path: Path) -> None:
+    """The stall may have used up most of the run's timeout before the archive opens."""
+    source = _three_markdown_docs(tmp_path)
+
+    class SlowToConfirm(StallingRunner):
+        def folder_names(self, account: str) -> frozenset[str]:
+            if any(path.suffix == ".enex" for path in self.opened):
+                self.archive_polls += 1
+            return super().folder_names(account)
+
+        def notes_in_folder(self, folder_id: str) -> list[ImportedNote]:
+            # The Import click on the fallback archive comes ~150 s after it opens.
+            if folder_id == _ARCHIVE_LANDING and self.archive_polls < 50:
+                return []
+            return super().notes_in_folder(folder_id)
+
+        archive_polls: int = 0
+
+    runner = SlowToConfirm(
+        markdown_notes=[_imported("md-a", 13)],
+        archive_notes=[_imported("enex-b", 14), _imported("enex-c", 15)],
+    )
+    report = run_enex_import(
+        runner,
+        _config(tmp_path),
+        source_dir=source,
+        markdown=True,
+        timeout_seconds=200.0,
+        stall_seconds=120.0,
+    )
+
+    assert report.elapsed_seconds > 200.0, "the fallback outlived the first deadline"
+    assert report.moved == 3
+    assert report.failed == []
+
+
+def test_a_note_that_arrives_after_the_restart_is_filed_not_reimported(tmp_path: Path) -> None:
+    source = _three_markdown_docs(tmp_path)
+    runner = StallingRunner(
+        markdown_notes=[_imported("md-a", 13)],
+        late_notes=[_imported("md-b", 14)],
+        archive_notes=[_imported("enex-c", 15)],
+    )
+
+    report = run_enex_import(runner, _config(tmp_path), source_dir=source, markdown=True)
+
+    archive = _fallback_archive(tmp_path).read_text(encoding="utf-8")
+    assert _url(14) not in archive, "the late note is already in Notes"
+    assert _url(13) not in archive
+    assert _url(15) in archive
+    assert sorted(note_id for note_id, _ in runner.moved) == ["enex-c", "md-a", "md-b"]
+    assert report.imported == 3
+    assert report.rerouted == 1
+    assert report.failed == []
+    assert report.unmatched == []
+    assert [target[0] for target in report.indent_targets] == ["enex-c"]
+
+
+def test_late_arrivals_covering_everything_need_no_fallback_archive(tmp_path: Path) -> None:
+    source = _three_markdown_docs(tmp_path)
+    runner = StallingRunner(
+        markdown_notes=[_imported("md-a", 13)],
+        late_notes=[_imported("md-b", 14), _imported("md-c", 15)],
+    )
+
+    report = run_enex_import(runner, _config(tmp_path), source_dir=source, markdown=True)
+
+    assert len(runner.opened) == 1
+    assert not _fallback_archive(tmp_path).exists()
+    assert report.moved == 3
+    assert report.rerouted == 0
+    assert report.failed == []
+    assert report.indent_targets == []
+
+
+def test_a_note_left_in_the_markdown_folder_is_not_reported_twice(tmp_path: Path) -> None:
+    """A stray note seen before the restart is unmatched once, not again on the re-read."""
+    source = _three_markdown_docs(tmp_path)
+    stray = ImportedNote("stray", "Stray", "<div>no provenance</div>")
+    runner = StallingRunner(
+        markdown_notes=[_imported("md-a", 13), stray],
+        archive_notes=[_imported("enex-b", 14), _imported("enex-c", 15)],
+    )
+
+    report = run_enex_import(runner, _config(tmp_path), source_dir=source, markdown=True)
+
+    assert report.unmatched == ["Stray"]
+    assert report.imported == 4
+    assert report.moved == 3
+
+
+def test_a_fallback_archive_that_stays_short_fails_the_rest_exactly_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The fallback archive has no stall cutoff: nothing would stop Notes after it."""
+    source = _three_markdown_docs(tmp_path)
+    runner = StallingRunner(
+        markdown_notes=[_imported("md-a", 13)],
+        archive_notes=[_imported("enex-b", 14)],
+    )
+
+    with caplog.at_level("WARNING", logger="quip2md.notes_enex"):
+        report = run_enex_import(
+            runner,
+            _config(tmp_path),
+            source_dir=source,
+            markdown=True,
+            timeout_seconds=600.0,
+            stall_seconds=60.0,
+        )
+
+    # 60 s for the Markdown stall, then the archive's whole fresh 600 s.
+    assert report.elapsed_seconds >= 660.0
+    assert caplog.text.count("stopped delivering") == 1, "only the Markdown batch is cut off"
+    assert "'Imported Notes' holds 1 of the 2 note(s)" in caplog.text
+    assert caplog.text.count("Notes stopped short") == 1
+    assert runner.restarts == 1, "an archive that stays short does not fall back again"
+    assert len(runner.opened) == 2
+    assert report.moved == 2
+    assert report.rerouted == 2
+    assert [key for key, _ in report.failed] == ["THREAD0015"]
+    assert "never arrived in 'Imported Notes'" in report.failed[0][1]
+
+
+def test_without_fallback_a_stalled_markdown_import_waits_out_the_deadline(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Nothing restarts Notes here, so leaving early could orphan notes still arriving."""
+    source = _three_markdown_docs(tmp_path)
+    runner = StallingRunner(
+        markdown_notes=[_imported("md-a", 13)],
+        archive_notes=[_imported("enex-b", 14), _imported("enex-c", 15)],
+    )
+
+    with caplog.at_level("WARNING", logger="quip2md.notes_enex"):
+        report = run_enex_import(
+            runner, _config(tmp_path), source_dir=source, markdown=True, fallback=False
+        )
+
+    assert report.elapsed_seconds >= notes_enex.IMPORT_TIMEOUT_SECONDS
+    assert "Notes stopped short" in caplog.text
+    assert "stopped delivering" not in caplog.text
+    assert runner.restarts == 0
+    assert len(runner.opened) == 1
+    assert not _fallback_archive(tmp_path).exists()
+    assert report.moved == 1
+    assert report.rerouted == 0
+    assert [key for key, _ in report.failed] == ["THREAD0014", "THREAD0015"]
+    assert all("never arrived" in reason for _, reason in report.failed)
+
+
+def test_a_restart_that_fails_reports_the_rest_and_imports_nothing_more(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    source = _three_markdown_docs(tmp_path)
+
+    class CannotRestart(StallingRunner):
+        def restart_notes(self) -> None:
+            super().restart_notes()
+            raise NotesError("Notes could not be quit, even with SIGKILL")
+
+    runner = CannotRestart(markdown_notes=[_imported("md-a", 13)])
+    with caplog.at_level("ERROR", logger="quip2md.notes_enex"):
+        report = run_enex_import(runner, _config(tmp_path), source_dir=source, markdown=True)
+
+    assert len(runner.opened) == 1, "no second import into a Notes in an unknown state"
+    assert [key for key, _ in report.failed] == ["THREAD0014", "THREAD0015"]
+    assert report.rerouted == 0
+    assert "Could not restart Notes" in caplog.text
+
+
+def test_a_stalled_archive_import_waits_out_the_deadline_and_never_restarts_notes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    source = tmp_path / "export"
+    _write_doc(source, "A.md", quip_id="THREAD0013", url=_url(13), title="A")
+    _write_doc(source, "B.md", quip_id="THREAD0014", url=_url(14), title="B")
+    runner = FakeEnexRunner(landing_notes=[_imported("id-1", 13)])
+
+    with caplog.at_level("WARNING", logger="quip2md.notes_enex"):
+        report = run_enex_import(
+            runner,
+            _config(tmp_path),
+            source_dir=source,
+            confirm=False,
+            timeout_seconds=300.0,
+            stall_seconds=30.0,
+        )
+
+    assert report.elapsed_seconds >= 300.0, "an archive has no stall cutoff"
+    assert "Notes stopped short" in caplog.text
+    assert "stopped delivering" not in caplog.text
+    assert runner.restarts == 0
+    assert len(runner.opened) == 1
+    assert not _fallback_archive(tmp_path).exists()
+    assert [key for key, _ in report.failed] == ["THREAD0014"]
+
+
+def test_the_archive_batch_of_a_markdown_run_never_restarts_notes(tmp_path: Path) -> None:
+    """An image document rides the archive even with `markdown`; it has no fallback."""
+    source = tmp_path / "export"
+    for number, title in ((13, "A"), (14, "B")):
+        _write_doc(
+            source,
+            f"{title}.md",
+            quip_id=f"THREAD00{number}",
+            url=_url(number),
+            title=title,
+            body="![p](x.png)\n",
+        )
+    runner = FakeEnexRunner(landing_notes=[_imported("id-1", 13)])
+
+    report = run_enex_import(runner, _config(tmp_path), source_dir=source, markdown=True)
+
+    assert report.elapsed_seconds >= notes_enex.IMPORT_TIMEOUT_SECONDS
+    assert runner.restarts == 0
+    assert len(runner.opened) == 1
+    assert [key for key, _ in report.failed] == ["THREAD0014"]
+
+
+def test_adopting_a_short_markdown_folder_never_restarts_notes(tmp_path: Path) -> None:
+    source = _three_markdown_docs(tmp_path)
+    runner = StallingRunner(markdown_notes=[_imported("md-a", 13)])
+
+    report = run_enex_import(
+        runner,
+        _config(tmp_path),
+        source_dir=source,
+        markdown=True,
+        adopt_landing="Imported Notes/quip2md-markdown-20261005T000000Z",
+    )
+
+    assert runner.restarts == 0
+    assert runner.opened == []
+    assert not _fallback_archive(tmp_path).exists()
+    assert report.moved == 1
+    assert report.rerouted == 0
+    assert report.failed == []
+
+
+def test_rerouted_is_merged_and_serialised() -> None:
+    report = EnexImportReport(rerouted=2)
+    report.merge(EnexImportReport(rerouted=3))
+    assert report.rerouted == 5
+    assert report.as_dict()["rerouted"] == 5
+
+
 # --- EnexNotesRunner --------------------------------------------------------
 
 
@@ -1493,6 +1911,185 @@ def test_a_failed_open_is_reported_rather_than_leaving_the_run_waiting(
     _stub_subprocess(monkeypatch, returncode=1, stderr="Unable to find application")
     with pytest.raises(NotesError, match="could not hand quip2md.enex to Notes"):
         EnexNotesRunner().open_enex(tmp_path / "quip2md.enex")
+
+
+# --- Restarting Notes ---------------------------------------------------------
+
+_NOTES_PID = 4242
+
+
+@dataclass
+class FakeNotesProcess:
+    """A Notes process behind `subprocess.run` and `os.kill`; nothing real runs.
+
+    `dies_on` is what finally stops it: "quit" (the scripted request), "TERM",
+    "KILL" or "never".
+    """
+
+    dies_on: str
+    answers_after_relaunch: bool = True
+    quit_request_hangs: bool = False
+    alive: bool = True
+    commands: list[list[str]] = field(default_factory=list)
+    signals: list[tuple[int, int]] = field(default_factory=list)
+
+    def run(self, command: Sequence[str], *args: Any, **kwargs: Any) -> FakeCompletedProcess:
+        assert kwargs.get("check") is False and kwargs.get("capture_output") is True
+        assert "shell" not in kwargs
+        self.commands.append(list(command))
+        match command[0]:
+            case "osascript" if command[2] == notes_enex._AS_QUIT_NOTES:
+                if self.quit_request_hangs:
+                    raise subprocess.TimeoutExpired(cmd="osascript", timeout=kwargs["timeout"])
+                if self.dies_on == "quit":
+                    self.alive = False
+                    return FakeCompletedProcess(returncode=0)
+                return FakeCompletedProcess(returncode=1, stderr="User canceled. (-128)")
+            case "osascript":
+                if self.answers_after_relaunch:
+                    return FakeCompletedProcess(returncode=0, stdout="iCloud\n")
+                return FakeCompletedProcess(returncode=1, stderr="Connection is invalid. (-609)")
+            case "pgrep":
+                if self.alive:
+                    return FakeCompletedProcess(returncode=0, stdout=f"{_NOTES_PID}\n")
+                return FakeCompletedProcess(returncode=1)
+            case "open":
+                self.alive = True
+                return FakeCompletedProcess(returncode=0)
+            case other:
+                raise AssertionError(f"unexpected command {other!r}")
+
+    def kill(self, pid: int, signum: int) -> None:
+        self.signals.append((pid, signum))
+        if signal.Signals(signum).name == f"SIG{self.dies_on}":
+            self.alive = False
+
+    def executables(self) -> list[str]:
+        return [command[0] for command in self.commands]
+
+
+def _fake_notes_process(monkeypatch: pytest.MonkeyPatch, process: FakeNotesProcess) -> None:
+    monkeypatch.setattr(notes_enex.subprocess, "run", process.run)
+    monkeypatch.setattr(notes_enex.os, "kill", process.kill)
+
+
+_RELAUNCH = ["open", "-g", "-a", "Notes"]
+
+
+def test_restart_notes_quits_gracefully_then_relaunches(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = FakeNotesProcess(dies_on="quit")
+    _fake_notes_process(monkeypatch, process)
+
+    EnexNotesRunner().restart_notes()
+
+    assert process.signals == []
+    assert process.commands[0] == ["osascript", "-e", 'tell application "Notes" to quit']
+    assert process.commands[1][:2] == ["pgrep", "-x"] and process.commands[1][-1] == "Notes"
+    assert process.commands[2] == _RELAUNCH
+    # The relaunch counts once Notes answers a script again.
+    assert process.executables()[3:] == ["osascript"]
+    assert process.alive
+
+
+def test_restart_notes_terminates_a_notes_that_refuses_to_quit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Notes answers a quit request with -128 while it is importing."""
+    process = FakeNotesProcess(dies_on="TERM")
+    _fake_notes_process(monkeypatch, process)
+
+    EnexNotesRunner().restart_notes()
+
+    assert process.signals == [(_NOTES_PID, signal.SIGTERM)]
+    assert time.monotonic() == 10.0, "the quit request gets its ten seconds first"
+    assert _RELAUNCH in process.commands
+
+
+def test_restart_notes_tolerates_a_quit_request_that_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakeNotesProcess(dies_on="TERM", quit_request_hangs=True)
+    _fake_notes_process(monkeypatch, process)
+
+    EnexNotesRunner().restart_notes()
+
+    assert process.signals == [(_NOTES_PID, signal.SIGTERM)]
+    assert _RELAUNCH in process.commands
+
+
+def test_restart_notes_kills_a_notes_that_ignores_sigterm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakeNotesProcess(dies_on="KILL")
+    _fake_notes_process(monkeypatch, process)
+
+    EnexNotesRunner().restart_notes()
+
+    assert process.signals == [(_NOTES_PID, signal.SIGTERM), (_NOTES_PID, signal.SIGKILL)]
+    assert time.monotonic() == 30.0, "ten seconds to quit, twenty more to terminate"
+    assert _RELAUNCH in process.commands
+
+
+def test_restart_notes_gives_up_on_a_notes_that_cannot_be_killed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakeNotesProcess(dies_on="never")
+    _fake_notes_process(monkeypatch, process)
+
+    with pytest.raises(NotesError, match="could not be quit"):
+        EnexNotesRunner().restart_notes()
+
+    assert process.signals == [(_NOTES_PID, signal.SIGTERM), (_NOTES_PID, signal.SIGKILL)]
+    assert "open" not in process.executables(), "never relaunch over a running Notes"
+
+
+def test_restart_notes_survives_a_notes_that_exits_before_the_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakeNotesProcess(dies_on="never")
+    _fake_notes_process(monkeypatch, process)
+
+    def gone(pid: int, signum: int) -> None:
+        process.alive = False
+        raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(notes_enex.os, "kill", gone)
+
+    EnexNotesRunner().restart_notes()
+
+    assert _RELAUNCH in process.commands
+
+
+def test_restart_notes_fails_when_the_relaunched_notes_never_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakeNotesProcess(dies_on="quit", answers_after_relaunch=False)
+    _fake_notes_process(monkeypatch, process)
+
+    with pytest.raises(NotesError, match="did not answer within 60s"):
+        EnexNotesRunner().restart_notes()
+
+    assert time.monotonic() == 60.0
+    assert process.executables().count("osascript") > 2, "it kept asking until the budget ran out"
+
+
+def test_restart_notes_fails_when_notes_cannot_be_relaunched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakeNotesProcess(dies_on="quit")
+    _fake_notes_process(monkeypatch, process)
+    real_run = process.run
+
+    def run(command: Sequence[str], *args: Any, **kwargs: Any) -> FakeCompletedProcess:
+        if command[0] == "open":
+            process.commands.append(list(command))
+            return FakeCompletedProcess(returncode=1, stderr="Unable to find application")
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(notes_enex.subprocess, "run", run)
+
+    with pytest.raises(NotesError, match="could not relaunch Notes"):
+        EnexNotesRunner().restart_notes()
 
 
 def test_a_source_directory_that_does_not_exist_is_an_error(tmp_path: Path) -> None:

@@ -176,6 +176,7 @@ class TwoRouteRunner:
     opened: list[Path] = field(default_factory=list)
     moved: list[tuple[str, str]] = field(default_factory=list)
     child_lookups: list[tuple[str, str]] = field(default_factory=list)
+    restarts: int = 0
 
     def resolve_account(self, *, local: bool) -> str:
         return "iCloud"
@@ -206,6 +207,9 @@ class TwoRouteRunner:
 
     def open_enex(self, path: Path) -> None:
         self.opened.append(path)
+
+    def restart_notes(self) -> None:
+        self.restarts += 1
 
 
 @pytest.fixture(autouse=True)
@@ -361,6 +365,63 @@ def test_the_cli_defaults_to_enex_elsewhere(
     seen = _capture_run(monkeypatch)
     assert cli.main(["import-notes", "--dryrun"]) == 0
     assert seen["markdown"] is False
+
+
+def test_the_cli_falls_back_by_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    seen = _capture_run(monkeypatch)
+    assert cli.main(["import-notes", "--dryrun"]) == 0
+    assert seen["fallback"] is True
+
+
+def test_no_fallback_turns_the_fallback_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    seen = _capture_run(monkeypatch)
+    assert cli.main(["import-notes", "--dryrun", "--no-fallback"]) == 0
+    assert seen["fallback"] is False
+
+
+def test_the_cli_report_counts_the_rerouted_documents(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "EnexNotesRunner", lambda: TwoRouteRunner([]))
+
+    def fake_run(runner: object, config: Config, **kwargs: Any) -> notes_enex.EnexImportReport:
+        return notes_enex.EnexImportReport(rerouted=0 if config.dry_run else 7)
+
+    monkeypatch.setattr(cli, "run_enex_import", fake_run)
+    assert cli.main(["import-notes"]) == 0
+    assert "  rerouted via archive: 7\n" in capsys.readouterr().out
+    assert cli.main(["import-notes", "--dryrun"]) == 0
+    assert "rerouted" not in capsys.readouterr().out
+
+
+def test_a_fallback_archive_that_also_stalls_exits_1(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Markdown delivers nothing, the fallback archive one of two: one failure, once."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "markdown_import_available", lambda: True)
+    root = tmp_path / "export"
+    _write_doc(root, "Private/One.md", quip_id="THREAD0001", title="One", body="x\n")
+    _write_doc(root, "Private/Two.md", quip_id="THREAD0002", title="Two", body="y\n")
+    runner = TwoRouteRunner([[], [_note("n-one", "THREAD0001")]])
+    monkeypatch.setattr(cli, "EnexNotesRunner", lambda: runner)
+
+    assert cli.main(["import-notes"]) == 1
+
+    out = capsys.readouterr().out
+    assert runner.restarts == 1
+    assert runner.moved == [("n-one", "folder:Quip/Private")]
+    assert "rerouted via archive: 2" in out
+    assert "failed:              1" in out
+    assert out.count("THREAD0002: never arrived") == 1
+    report = json.loads((tmp_path / ".quip2md" / "last_notes_run.json").read_text())
+    assert report["rerouted"] == 2
+    assert [entry["key"] for entry in report["failed"]] == ["THREAD0002"]
 
 
 def test_asking_for_markdown_without_support_is_rejected(

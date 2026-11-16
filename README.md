@@ -138,6 +138,7 @@ All flags are under the `import-notes` subcommand.
 | `--only KEY` | Restrict the import to one note: a Quip thread id (from a source file's `quip_id` frontmatter), or, for a file without that frontmatter, its `path:<relative/posix/path>` key. Repeatable. |
 | `--enex-file PATH` | Where to write the Evernote archive. Defaults to `.quip2md/quip2md.enex`. |
 | `--adopt-landing FOLDER` | Resume an import whose notes reached Notes but were never filed, e.g. one that failed after you clicked Import. Imports nothing; files the notes already sitting in the named landing folder and records them in the state file. For a Markdown import, name the nested folder as `"Imported Notes/quip2md-markdown-<stamp>"`. Use this instead of re-running, which would import a second copy of every document. Rejected with `--writer applescript`. |
+| `--no-fallback` | On a stalled Markdown import (no new note for 3 minutes), do not quit Notes or re-route the remaining documents through the archive; the stalled import waits for the full 15-minute timeout and the documents still missing are reported as failed. By default the run quits and relaunches Notes and re-imports the remaining documents through an Evernote archive. |
 | `--workers N` | Number of processes used to render Markdown to ENML for the archive (`markdown` and `enex` writers). Defaults to the CPU count capped at 6 (measured optimum on a 4P+4E Apple Silicon machine; a homogeneous x86-64 box may benefit from more). `1` renders in-process. Output is byte-identical at any setting. |
 | `--indent-checklists` | After the import, drive the Notes editor to restore nested checklist levels in notes that came through the archive. Needs Accessibility permission (see below) and changes each touched note's modification date. Off by default; rejected with `--writer applescript`. |
 
@@ -233,10 +234,22 @@ polls until its note count stops growing. Each note is then matched back to its 
 `Source:` provenance line (only that line counts, so a link to another exported
 document cannot mis-file a note) and moved into its mirrored folder under
 `Quip`. Notes it cannot match are left there and listed in the report, and the
-run exits with status 1 so they are not mistaken for a clean import. If
-Notes stalls and the 15-minute wait expires, the run files the notes that
-arrived, lists every document that did not under `failed`, and exits with
-status 1. This writer preserves:
+run exits with status 1 so they are not mistaken for a clean import.
+
+A Markdown import has stalled when its folder gains no new note for 3 minutes.
+The run then stops waiting, files the notes that arrived, and recovers
+automatically: it quits and relaunches Notes, then re-imports the remaining
+documents through an archive (`.quip2md/quip2md-fallback.enex`). That needs
+one more **Import** confirmation on Notes versions that ask, and nested
+checklists in those notes arrive flat, as in any archive import.
+
+The 3-minute cutoff applies only there, because the run then restarts Notes,
+which stops the importer. Every other import waits for the full 15-minute
+timeout: an archive import (the fallback archive included) never falls back,
+and with `--no-fallback` neither does a Markdown import. Any document still
+missing at the end is listed under `failed`, and the run exits with status 1.
+
+This writer preserves:
 
 - clickable hyperlinks, including the link back to the original Quip document;
 - native checklists, with checked and unchecked state;

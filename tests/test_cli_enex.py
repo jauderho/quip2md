@@ -68,6 +68,7 @@ class _FakeEnexRunner:
         self.opened: list[Path] = []
         self.moved: list[tuple[str, str]] = []
         self.landing_notes: list[ImportedNote] = []
+        self.restarts = 0
         self._opened_yet = False
 
     def resolve_account(self, *, local: bool) -> str:
@@ -100,6 +101,9 @@ class _FakeEnexRunner:
     def open_enex(self, path: Path) -> None:
         self.opened.append(path)
         self._opened_yet = True
+
+    def restart_notes(self) -> None:
+        self.restarts += 1
 
 
 def _matching_runner(*pairs: tuple[str, str]) -> _FakeEnexRunner:

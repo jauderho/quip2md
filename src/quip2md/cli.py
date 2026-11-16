@@ -6,7 +6,7 @@ Usage:
     quip2md import-notes [--source DIR] [--writer markdown|enex|applescript]
                     [--enex-file FILE] [--indent-checklists] [--local]
                     [--dryrun] [--verbose | -v] [--force] [--workers N]
-                    [--only KEY [--only KEY ...]]
+                    [--only KEY [--only KEY ...]] [--no-fallback]
 
 Switches (all under the `export` subcommand):
     --output DIR        Directory to write the exported Markdown tree into.
@@ -85,6 +85,10 @@ Switches (all under the `import-notes` subcommand):
                          frontmatter, its `path:<relative/posix/path>` key
                          (see `quip2md.notes_import.scan_source`). May be
                          repeated.
+    --no-fallback         On a stalled Markdown import (no new note for three
+                         minutes), do not quit Notes or re-route the
+                         remaining documents through the archive; wait for
+                         the full timeout and report them as failed instead.
 
 `import-notes` is a purely offline operation over `--source` and never reads
 `QUIP_TOKEN` or `.env`. On macOS, the *first* `import-notes` run in a while
@@ -317,6 +321,14 @@ def _build_parser() -> argparse.ArgumentParser:
             "(not valid with --writer applescript). Imports nothing; files the "
             "notes already in the named landing folder. Use this instead of re-running "
             "after a failure, which would import a second copy of everything."
+        ),
+    )
+    notes_parser.add_argument(
+        "--no-fallback",
+        action="store_true",
+        help=(
+            "On a stalled Markdown import, do not quit Notes or re-route the "
+            "remaining documents through the archive; report them as failed instead."
         ),
     )
     notes_parser.add_argument(
@@ -555,6 +567,7 @@ def _main_import_notes_enex(args: argparse.Namespace, config: Config) -> int:
             workers=args.workers,
             adopt_landing=args.adopt_landing,
             markdown=args.writer == "markdown",
+            fallback=not args.no_fallback,
         )
     except KeyboardInterrupt:
         print(
@@ -639,6 +652,8 @@ def _print_enex_report(report: EnexImportReport, *, dry_run: bool) -> None:
             print(f"  unmatched (left in {folder}): {len(report.unmatched)}")
             for name in report.unmatched[:10]:
                 print(f"    - {name}")
+        if report.rerouted:
+            print(f"  rerouted via archive: {report.rerouted}")
     print(f"  conversion warnings: {report.warnings}")
     if report.failed:
         print(f"  failed:              {len(report.failed)}")

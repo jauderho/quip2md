@@ -46,6 +46,7 @@ import os
 import plistlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -79,6 +80,10 @@ logger = logging.getLogger("quip2md.notes_enex")
 NOTES_STATE_FILENAME = "notes_state.json"
 DEFAULT_ENEX_FILENAME = "quip2md.enex"
 
+#: The archive a stalled Markdown import's undelivered documents are re-routed
+#: through. Separate from `DEFAULT_ENEX_FILENAME`, which the run may still hold.
+FALLBACK_ENEX_FILENAME = "quip2md-fallback.enex"
+
 #: Notes names its landing folders "Imported Notes", "Imported Notes 1", ...
 LANDING_FOLDER_PREFIX = "Imported Notes"
 
@@ -106,6 +111,12 @@ _EMPTY_TASK_MARKER_RE = re.compile(
 IMPORT_POLL_INTERVAL_SECONDS = 3.0
 IMPORT_TIMEOUT_SECONDS = 900.0
 
+#: How long the landing folder may go without a new note before the import
+#: counts as stalled. Notes' Markdown importer has hung mid-import at a frozen
+#: count; without this the run would sit out the whole timeout. Applied only
+#: where the run then restarts Notes (see `_import_batch`).
+IMPORT_STALL_SECONDS = 180.0
+
 #: Matches the provenance URL in a note body read back from Notes.
 _QUIP_URL_RE = re.compile(r"https?://(?:[\w.-]*\.)?quip\.com/[\w-]+", re.IGNORECASE)
 
@@ -119,6 +130,17 @@ _FIRST_INVOCATION_TIMEOUT_SECONDS = 120.0
 _SUBSEQUENT_INVOCATION_TIMEOUT_SECONDS = 60.0
 
 _NOTE_READ_TIMEOUT_SECONDS = 300.0
+
+#: `restart_notes()` budgets. Notes refuses a scripted quit while it is
+#: importing, so each step escalates only after the one before it had its time.
+_QUIT_REQUEST_TIMEOUT_SECONDS = 10.0
+_QUIT_WAIT_SECONDS = 10.0
+_SIGTERM_WAIT_SECONDS = 20.0
+_SIGKILL_WAIT_SECONDS = 5.0
+_PROCESS_POLL_INTERVAL_SECONDS = 0.5
+_RELAUNCH_WAIT_SECONDS = 60.0
+_RELAUNCH_POLL_INTERVAL_SECONDS = 2.0
+_RELAUNCH_PROBE_TIMEOUT_SECONDS = 15.0
 
 #: How much of each body to fetch. The provenance line is the first block;
 #: whole bodies would only bloat stdout for no gain.
@@ -182,6 +204,8 @@ class EnexImportReport:
     moved: int = 0
     skipped_unchanged: int = 0
     superseded: int = 0
+    #: Documents a stalled Markdown import re-routed through the fallback archive.
+    rerouted: int = 0
     landing_folder: str = ""
     unmatched: list[str] = field(default_factory=list)
     failed: list[tuple[str, str]] = field(default_factory=list)
@@ -216,6 +240,7 @@ class EnexImportReport:
         self.moved += other.moved
         self.skipped_unchanged += other.skipped_unchanged
         self.superseded += other.superseded
+        self.rerouted += other.rerouted
         self.warnings += other.warnings
         self.unmatched.extend(other.unmatched)
         self.failed.extend(other.failed)
@@ -238,6 +263,7 @@ class EnexImportReport:
             "moved": self.moved,
             "skipped_unchanged": self.skipped_unchanged,
             "superseded": self.superseded,
+            "rerouted": self.rerouted,
             "landing_folder": self.landing_folder,
             "unmatched": self.unmatched,
             "failed": [{"key": key, "reason": reason} for key, reason in self.failed],
@@ -270,6 +296,8 @@ class EnexNotesRunnerProtocol(Protocol):
 
     def open_enex(self, path: Path) -> None: ...
 
+    def restart_notes(self) -> None: ...
+
 
 _AS_LIST_ACCOUNTS = """
 on run argv
@@ -278,6 +306,8 @@ on run argv
     end tell
 end run
 """
+
+_AS_QUIT_NOTES = 'tell application "Notes" to quit'
 
 _AS_FOLDER_NAMES = """
 on run argv
@@ -584,6 +614,79 @@ class EnexNotesRunner:
         if proc.returncode != 0:
             raise NotesError(f"could not hand {path.name} to Notes", stderr=proc.stderr.strip())
 
+    def restart_notes(self) -> None:
+        """Quit Notes -- by force if it must be -- and relaunch it.
+
+        The way out of a hung import. Notes refuses a scripted quit while it
+        is importing (error -128), so the request is only the first step:
+        SIGTERM follows, then SIGKILL. A terminated Notes loses nothing that
+        had already arrived, and does not resume the import when relaunched.
+        """
+        try:
+            subprocess.run(
+                ["osascript", "-e", _AS_QUIT_NOTES],
+                capture_output=True,
+                text=True,
+                timeout=_QUIT_REQUEST_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            logger.debug("Notes did not answer the quit request")
+        if not self._await_notes_exit(_QUIT_WAIT_SECONDS):
+            logger.warning("Notes did not quit when asked; terminating it.")
+            self._signal_notes(signal.SIGTERM)
+            if not self._await_notes_exit(_SIGTERM_WAIT_SECONDS):
+                logger.warning("Notes ignored the termination request; killing it.")
+                self._signal_notes(signal.SIGKILL)
+                if not self._await_notes_exit(_SIGKILL_WAIT_SECONDS):
+                    raise NotesError("Notes could not be quit, even with SIGKILL")
+
+        proc = subprocess.run(
+            ["open", "-g", "-a", "Notes"], capture_output=True, text=True, check=False
+        )
+        if proc.returncode != 0:
+            raise NotesError("could not relaunch Notes", stderr=proc.stderr.strip())
+        deadline = time.monotonic() + _RELAUNCH_WAIT_SECONDS
+        while True:
+            try:
+                self._run(_AS_LIST_ACCOUNTS, [], timeout=_RELAUNCH_PROBE_TIMEOUT_SECONDS)
+            except NotesError:
+                if time.monotonic() >= deadline:
+                    raise NotesError(
+                        f"Notes did not answer within {_RELAUNCH_WAIT_SECONDS:.0f}s of "
+                        "being relaunched"
+                    ) from None
+                time.sleep(_RELAUNCH_POLL_INTERVAL_SECONDS)
+            else:
+                return
+
+    @staticmethod
+    def _notes_pids() -> list[int]:
+        """Pids of this user's running Notes processes; empty when it is not running."""
+        proc = subprocess.run(
+            ["pgrep", "-x", "-U", str(os.getuid()), "Notes"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return [int(part) for part in proc.stdout.split() if part.isdigit()]
+
+    def _await_notes_exit(self, seconds: float) -> bool:
+        """Poll until Notes is gone; False if it is still running after `seconds`."""
+        deadline = time.monotonic() + seconds
+        while self._notes_pids():
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_PROCESS_POLL_INTERVAL_SECONDS)
+        return True
+
+    def _signal_notes(self, signum: signal.Signals) -> None:
+        for pid in self._notes_pids():
+            try:
+                os.kill(pid, signum)
+            except ProcessLookupError:
+                continue  # it exited between the listing and the signal
+
 
 # --- Markdown route ------------------------------------------------------
 
@@ -800,6 +903,8 @@ def run_enex_import(
     workers: int | None = None,
     adopt_landing: str | None = None,
     markdown: bool = False,
+    stall_seconds: float = IMPORT_STALL_SECONDS,
+    fallback: bool = True,
 ) -> EnexImportReport:
     """Render `source_dir` to a single `.enex` and import it into Notes.
 
@@ -817,6 +922,23 @@ def run_enex_import(
     `confirm` exists so the caller can suppress the "click Import" prompt in a
     non-interactive context; the sheet still has to be clicked by a human
     either way, which is why the wait is generous and its timeout explicit.
+
+    With `fallback`, a Markdown import whose landing folder gains no note for
+    `stall_seconds` has stalled, and the run recovers on its own instead of
+    sitting out the whole timeout: it quits and relaunches Notes
+    (`runner.restart_notes()`), files whatever arrived late, and imports the
+    documents still missing through a second archive
+    (`FALLBACK_ENEX_FILENAME`, with its own confirmation and a fresh timeout).
+    They are counted in `report.rerouted`, and their nested checklists arrive
+    flat, as in any archive import.
+
+    The stall cutoff applies to nothing else. It is only safe because the
+    restart stops the importer: a slow import abandoned early would keep
+    delivering notes that are never filed or recorded, and the next run would
+    import them a second time. So an archive import (the fallback archive
+    included), and a Markdown import without `fallback`, wait for the full
+    timeout and never restart Notes. A document that is still missing in the
+    end is listed in `report.failed`.
 
     A source whose rendered content still matches its `notes_state.json` entry
     is skipped (counted in `report.skipped_unchanged`) unless `config.force`;
@@ -898,6 +1020,8 @@ def run_enex_import(
             confirm=confirm,
             timeout_seconds=timeout_seconds,
             adopt_landing=adopt_landing,
+            stall_seconds=stall_seconds,
+            fallback_path=(config.state_path.parent / FALLBACK_ENEX_FILENAME if fallback else None),
         )
 
 
@@ -912,6 +1036,8 @@ def _import_into_notes(
     confirm: bool,
     timeout_seconds: float,
     adopt_landing: str | None,
+    stall_seconds: float = IMPORT_STALL_SECONDS,
+    fallback_path: Path | None = None,
 ) -> EnexImportReport:
     """Hand each batch to Notes and file what comes back. Holds the run lock.
 
@@ -920,6 +1046,9 @@ def _import_into_notes(
     (`None` for an archive, whose notes land directly in it), and the sources
     the batch carries. Batches run one after the other, each with its own
     confirmation, and share one deadline.
+
+    `fallback_path` is where a stalled Markdown batch writes the archive it
+    re-routes its undelivered documents through; `None` turns that off.
     """
     account = runner.resolve_account(local=False)
     deadline = time.monotonic() + timeout_seconds
@@ -939,6 +1068,9 @@ def _import_into_notes(
                     deadline=deadline,
                     confirm=confirm,
                     adopt_landing=adopt_landing,
+                    timeout_seconds=timeout_seconds,
+                    stall_seconds=stall_seconds,
+                    fallback_path=fallback_path,
                 )
             )
     finally:
@@ -969,6 +1101,9 @@ def _import_batch(
     deadline: float,
     confirm: bool,
     adopt_landing: str | None,
+    timeout_seconds: float = IMPORT_TIMEOUT_SECONDS,
+    stall_seconds: float = IMPORT_STALL_SECONDS,
+    fallback_path: Path | None = None,
 ) -> str:
     """Import one archive or Markdown folder and file its notes; returns the landing name."""
     if adopt_landing is not None:
@@ -1008,6 +1143,12 @@ def _import_batch(
             len(pending),
             deadline,
             already_there=before.get(landing_name, frozenset()),
+            # Giving up early is only safe when the run then restarts Notes:
+            # an importer left running keeps delivering notes nobody files,
+            # and the next run would import those documents a second time.
+            stall_seconds=(
+                stall_seconds if child is not None and fallback_path is not None else None
+            ),
         )
     report.imported += len(imported)
     _file_imported_notes(
@@ -1017,16 +1158,108 @@ def _import_batch(
         # A source Notes never delivered (the wait expired) is not in Notes at
         # all, so the run must not report success over it.
         arrived = {_extract_quip_url(note.body) for note in imported}
-        for source, _note in pending:
-            if source.quip_url not in arrived:
-                report.failed.append(
-                    (
-                        source.key,
-                        f"never arrived in {landing_name!r} before the wait expired; "
-                        "re-run to import it",
-                    )
-                )
+        missing = [item for item in pending if item[0].quip_url not in arrived]
+        if missing and child is not None and fallback_path is not None:
+            # Only the Markdown importer is known to hang, and the archive
+            # route is what gets its documents in; an archive never falls back.
+            return _reroute_through_archive(
+                runner,
+                account,
+                report,
+                state,
+                landing_name,
+                landing_id,
+                frozenset(note.note_id for note in imported),
+                missing,
+                fallback_path,
+                confirm=confirm,
+                timeout_seconds=timeout_seconds,
+                stall_seconds=stall_seconds,
+            )
+        _fail_undelivered(report, landing_name, missing)
     return landing_name
+
+
+def _fail_undelivered(
+    report: EnexImportReport, landing_name: str, missing: Sequence[tuple[NoteSource, NoteEnml]]
+) -> None:
+    for source, _note in missing:
+        report.failed.append(
+            (
+                source.key,
+                f"never arrived in {landing_name!r} before the wait expired; re-run to import it",
+            )
+        )
+
+
+def _reroute_through_archive(
+    runner: EnexNotesRunnerProtocol,
+    account: str,
+    report: EnexImportReport,
+    state: NotesState,
+    landing_name: str,
+    landing_id: str,
+    seen: frozenset[str],
+    missing: Sequence[tuple[NoteSource, NoteEnml]],
+    fallback_path: Path,
+    *,
+    confirm: bool,
+    timeout_seconds: float,
+    stall_seconds: float,
+) -> str:
+    """Recover a stalled Markdown import; returns the landing folder name(s).
+
+    `missing` are the sources the Markdown folder never delivered and `seen`
+    the ids of the notes it did, which were dealt with already. Notes is
+    restarted (a hung importer never finishes, and blocks the next import),
+    the folder is read once more for notes that arrived after the wait ended,
+    and only what is still missing then goes into the fallback archive -- a
+    source that did arrive must never be imported a second time.
+    """
+    logger.warning(
+        "Notes stalled importing %r. Quitting and relaunching Notes, then importing "
+        "the %d remaining document(s) through the archive.",
+        landing_name,
+        len(missing),
+    )
+    try:
+        runner.restart_notes()
+        late = [note for note in runner.notes_in_folder(landing_id) if note.note_id not in seen]
+    except NotesError as exc:
+        # Without a clean restart and a trustworthy re-read, a second import
+        # could duplicate notes. Report the documents instead.
+        logger.error("Could not restart Notes to recover the import: %s", _error_reason(exc))
+        _fail_undelivered(report, landing_name, missing)
+        return landing_name
+    report.imported += len(late)
+    _file_imported_notes(runner, account, landing_id, late, missing, state, report, markdown=True)
+    arrived_late = {_extract_quip_url(note.body) for note in late}
+    remaining = [item for item in missing if item[0].quip_url not in arrived_late]
+    if not remaining:
+        return landing_name
+
+    fallback_path.parent.mkdir(parents=True, exist_ok=True)
+    fallback_path.write_text(build_enex([note for _source, note in remaining]), encoding="utf-8")
+    report.rerouted += len(remaining)
+    # `markdown=False`: an archive flattens nested checklists, so these notes
+    # are indent targets like any other archive note. No `fallback_path`: an
+    # archive waits out its deadline, then reports what is missing as failed.
+    fallback_landing = _import_batch(
+        runner,
+        account,
+        report,
+        state,
+        fallback_path,
+        None,
+        remaining,
+        markdown=False,
+        deadline=time.monotonic() + timeout_seconds,
+        confirm=confirm,
+        adopt_landing=None,
+        timeout_seconds=timeout_seconds,
+        stall_seconds=stall_seconds,
+    )
+    return f"{landing_name}, {fallback_landing}"
 
 
 def _write_enex(
@@ -1171,6 +1404,7 @@ def _await_landing_notes(
     deadline: float,
     *,
     already_there: frozenset[str] = frozenset(),
+    stall_seconds: float | None = None,
 ) -> list[ImportedNote]:
     """Poll the landing folder until it stops filling up, then read it once.
 
@@ -1184,6 +1418,12 @@ def _await_landing_notes(
     would silently leave the tail of the corpus unfiled, so this waits for the
     count to hold steady across two polls *and* reach the archive's own note
     count before returning.
+
+    A folder short of that count that gains no note for `stall_seconds` has
+    stalled: Notes' importer can hang mid-import, and never recovers. The wait
+    ends there, as it does at the deadline, with whatever arrived. `None`
+    turns the cutoff off, leaving the deadline alone -- which is what a caller
+    that will not restart Notes afterwards must pass.
     """
 
     def arrived() -> int:
@@ -1191,8 +1431,13 @@ def _await_landing_notes(
 
     count = arrived()
     previous = -1
+    most = -1
+    last_growth = 0.0
     while count != previous or count < expected:
-        if time.monotonic() >= deadline:
+        now = time.monotonic()
+        if count > most:
+            most, last_growth = count, now
+        if now >= deadline:
             logger.warning(
                 "Notes stopped short: folder %r holds %d of the %d note(s) in the "
                 "archive after the wait expired. Proceeding with those; re-run to "
@@ -1201,6 +1446,16 @@ def _await_landing_notes(
                 count,
                 expected,
                 max(expected - count, 0),
+            )
+            break
+        if stall_seconds is not None and count < expected and now - last_growth >= stall_seconds:
+            logger.warning(
+                "Notes stopped delivering: folder %r holds %d of the %d note(s) and "
+                "gained none in %.0f seconds. Proceeding with those.",
+                landing_name,
+                count,
+                expected,
+                now - last_growth,
             )
             break
         previous = count
