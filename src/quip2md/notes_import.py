@@ -94,7 +94,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from html import escape as html_escape
@@ -151,7 +151,7 @@ NOTES_LOCK_FILENAME = "notes.lock"
 
 
 @contextlib.contextmanager
-def notes_run_lock(state_dir: Path) -> Iterator[None]:
+def notes_run_lock(state_dir: Path) -> Generator[None]:
     """Hold an exclusive lock for the duration of a run that changes Notes.
 
     Two concurrent runs would each read the state file, each decide the same
